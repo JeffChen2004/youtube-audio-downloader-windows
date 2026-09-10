@@ -1,0 +1,21 @@
+# Local dependencies and downloaded media
+/tools/
+/downloads/
+*.opus
+*.webm
+*.mp3
+*.m4a
+*.flac
+*.wav
+*.part
+*.ytdl
+
+# Authentication files: never commit browser sessions
+*cookie*
+*Cookie*
+*.txt
+
+# Runtime logs and temporary files
+*.log
+*.tmp
+*.zip
