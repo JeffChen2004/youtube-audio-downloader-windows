@@ -6,12 +6,16 @@ Windows 圖形介面工具，支援影片或播放清單、音訊格式與品質
 
 1. 直接雙擊 `啟動下載器.cmd`（或對 `YoutubeAudioDownloader.ps1` 按右鍵，選 **使用 PowerShell 執行**）。
 2. 貼上 YouTube 影片或播放清單網址。
-3. 選擇格式（含 `opus`）與品質；`0（最佳）` 會以來源可用的最佳音訊下載／轉換。
+3. 選擇格式與品質模式。對 Opus 選「保留來源最佳品質」時，工具會檢查並直接下載最高位元率的原始 Opus；選「重新編碼」或輸出其他格式時，才會套用「轉碼品質」。
 4. 若內容需要登入才可存取，可在「登入瀏覽器」選擇已登入 YouTube 的瀏覽器。若出現 DPAPI 錯誤，請改用下方的 `cookies.txt` 檔案。
 
 首次執行會在 `tools` 資料夾下載官方的 `yt-dlp.exe`、FFmpeg 與 Deno。Deno 用於處理 YouTube 目前要求的 JavaScript challenge；音訊預設儲存在 `downloads`。
 
 下載 Opus 時，紀錄中可能先出現 `.webm`：這是 YouTube 提供的原始音訊容器，完成後會由 FFmpeg 轉封裝為 `.opus`。不需手動處理暫存檔。
+
+「檢查格式」會以 `yt-dlp -J` 依序探測 `Auto`、`web_music`、`web`、`mweb` 四種 YouTube player client，並從每個 client 的 audio-only 格式選出實際 abr 最高的 Opus。若 Auto 已達 250 kbps 以上會提前停止，以減少請求。工具快取探測結果；只有網址、cookies.txt 路徑或登入瀏覽器改變時才會失效。若找不到原始 Opus，工具會先詢問你是否下載其他最高品質的原始音訊，不會自動重新編碼。
+
+「詳細診斷」只測 `Auto` 與 `web_music`，並將 yt-dlp 的完整 verbose 輸出寫入 `logs\probe-debug-YYYYMMDD-HHMMSS.txt`。GUI 只顯示版本、cookies、登入／Premium 訊號、PO Token、SABR、格式與 JS/EJS 警告的摘要；未出現的訊號會標為 `Unknown` 或 `None reported`，不會推測原因。可用「更新 yt-dlp」按鈕從官方 release 手動取得最新版。
 
 
 ## 說明與限制
