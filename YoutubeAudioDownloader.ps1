@@ -41,6 +41,228 @@ namespace YtAudioDownloader {
 }
 '@
 }
+if (-not ('YtAudioDownloader.DownloadProcessController' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+
+namespace YtAudioDownloader {
+    public static class DownloadProcessController {
+        const uint TH32CS_SNAPPROCESS = 0x00000002;
+        const uint PROCESS_TERMINATE = 0x0001;
+        const uint PROCESS_SUSPEND_RESUME = 0x0800;
+        const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
+        const int JobObjectExtendedLimitInformation = 9;
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        struct PROCESSENTRY32 {
+            public uint dwSize;
+            public uint cntUsage;
+            public uint th32ProcessID;
+            public IntPtr th32DefaultHeapID;
+            public uint th32ModuleID;
+            public uint cntThreads;
+            public uint th32ParentProcessID;
+            public int pcPriClassBase;
+            public uint dwFlags;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+            public string szExeFile;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct JOBOBJECT_BASIC_LIMIT_INFORMATION {
+            public long PerProcessUserTimeLimit;
+            public long PerJobUserTimeLimit;
+            public uint LimitFlags;
+            public UIntPtr MinimumWorkingSetSize;
+            public UIntPtr MaximumWorkingSetSize;
+            public uint ActiveProcessLimit;
+            public UIntPtr Affinity;
+            public uint PriorityClass;
+            public uint SchedulingClass;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct IO_COUNTERS {
+            public ulong ReadOperationCount;
+            public ulong WriteOperationCount;
+            public ulong OtherOperationCount;
+            public ulong ReadTransferCount;
+            public ulong WriteTransferCount;
+            public ulong OtherTransferCount;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+            public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+            public IO_COUNTERS IoInfo;
+            public UIntPtr ProcessMemoryLimit;
+            public UIntPtr JobMemoryLimit;
+            public UIntPtr PeakProcessMemoryUsed;
+            public UIntPtr PeakJobMemoryUsed;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint processId);
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        static extern bool Process32First(IntPtr snapshot, ref PROCESSENTRY32 entry);
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        static extern bool Process32Next(IntPtr snapshot, ref PROCESSENTRY32 entry);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern IntPtr OpenProcess(uint access, bool inheritHandle, uint processId);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool TerminateProcess(IntPtr process, uint exitCode);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool CloseHandle(IntPtr handle);
+        [DllImport("ntdll.dll")]
+        static extern int NtSuspendProcess(IntPtr process);
+        [DllImport("ntdll.dll")]
+        static extern int NtResumeProcess(IntPtr process);
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        static extern IntPtr CreateJobObject(IntPtr attributes, string name);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool SetInformationJobObject(IntPtr job, int infoClass, IntPtr info, uint length);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool TerminateJobObject(IntPtr job, uint exitCode);
+
+        static List<int> Descendants(int rootPid) {
+            var parents = new Dictionary<int, List<int>>();
+            IntPtr snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if (snapshot == new IntPtr(-1))
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "Unable to enumerate process tree");
+            try {
+                var entry = new PROCESSENTRY32 { dwSize = (uint)Marshal.SizeOf(typeof(PROCESSENTRY32)) };
+                if (Process32First(snapshot, ref entry)) {
+                    do {
+                        int parent = unchecked((int)entry.th32ParentProcessID);
+                        int child = unchecked((int)entry.th32ProcessID);
+                        if (!parents.ContainsKey(parent)) parents[parent] = new List<int>();
+                        parents[parent].Add(child);
+                        entry.dwSize = (uint)Marshal.SizeOf(typeof(PROCESSENTRY32));
+                    } while (Process32Next(snapshot, ref entry));
+                }
+            } finally { CloseHandle(snapshot); }
+            var result = new List<int>();
+            var queue = new Queue<int>();
+            var seen = new HashSet<int>();
+            queue.Enqueue(rootPid);
+            seen.Add(rootPid);
+            while (queue.Count > 0) {
+                int parent = queue.Dequeue();
+                List<int> children;
+                if (!parents.TryGetValue(parent, out children)) continue;
+                foreach (int child in children) {
+                    if (!seen.Add(child)) continue;
+                    result.Add(child);
+                    queue.Enqueue(child);
+                }
+            }
+            return result;
+        }
+
+        static bool SuspendOne(int pid) {
+            IntPtr process = OpenProcess(PROCESS_SUSPEND_RESUME, false, unchecked((uint)pid));
+            if (process == IntPtr.Zero) return false;
+            try { return NtSuspendProcess(process) == 0; }
+            finally { CloseHandle(process); }
+        }
+
+        static bool ResumeOne(int pid) {
+            IntPtr process = OpenProcess(PROCESS_SUSPEND_RESUME, false, unchecked((uint)pid));
+            if (process == IntPtr.Zero) return false;
+            try { return NtResumeProcess(process) == 0; }
+            finally { CloseHandle(process); }
+        }
+
+        public static int[] SuspendTree(int rootPid) {
+            var suspended = new List<int>();
+            if (!SuspendOne(rootPid))
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "Unable to suspend yt-dlp");
+            suspended.Add(rootPid);
+            try {
+                foreach (int pid in Descendants(rootPid))
+                    if (SuspendOne(pid)) suspended.Add(pid);
+                return suspended.ToArray();
+            } catch {
+                ResumeProcesses(suspended.ToArray());
+                throw;
+            }
+        }
+
+        public static void ResumeProcesses(int[] processIds) {
+            if (processIds == null) return;
+            for (int index = processIds.Length - 1; index >= 1; index--)
+                ResumeOne(processIds[index]);
+            if (processIds.Length > 0 && !ResumeOne(processIds[0]))
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "Unable to resume yt-dlp");
+        }
+
+        public static IntPtr CreateKillOnCloseJob() {
+            IntPtr job = CreateJobObject(IntPtr.Zero, null);
+            if (job == IntPtr.Zero)
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "Unable to create download Job Object");
+            var limits = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            int size = Marshal.SizeOf(typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION));
+            IntPtr buffer = Marshal.AllocHGlobal(size);
+            try {
+                Marshal.StructureToPtr(limits, buffer, false);
+                if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, buffer, (uint)size))
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Unable to configure download Job Object");
+                return job;
+            } catch {
+                CloseHandle(job);
+                throw;
+            } finally { Marshal.FreeHGlobal(buffer); }
+        }
+
+        public static void AssignToJob(IntPtr job, IntPtr processHandle) {
+            if (!AssignProcessToJobObject(job, processHandle))
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "Unable to assign yt-dlp to download Job Object");
+        }
+
+        public static void TerminateJob(IntPtr job) {
+            if (job == IntPtr.Zero || !TerminateJobObject(job, 1))
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "Unable to terminate download Job Object");
+        }
+
+        public static void TerminateJobAndTree(IntPtr job, int rootPid) {
+            // Capture descendants first in case one was created in the very
+            // small interval between Process.Start and assignment to the job.
+            var descendants = Descendants(rootPid);
+            TerminateJob(job);
+            descendants.Reverse();
+            foreach (int pid in descendants) {
+                IntPtr process = OpenProcess(PROCESS_TERMINATE, false, unchecked((uint)pid));
+                if (process == IntPtr.Zero) continue;
+                try { TerminateProcess(process, 1); }
+                finally { CloseHandle(process); }
+            }
+        }
+
+        public static void TerminateTree(int rootPid) {
+            var processes = Descendants(rootPid);
+            processes.Reverse();
+            processes.Add(rootPid);
+            foreach (int pid in processes) {
+                IntPtr process = OpenProcess(PROCESS_TERMINATE, false, unchecked((uint)pid));
+                if (process == IntPtr.Zero) continue;
+                try { TerminateProcess(process, 1); }
+                finally { CloseHandle(process); }
+            }
+        }
+
+        public static void CloseJob(IntPtr job) {
+            if (job != IntPtr.Zero) CloseHandle(job);
+        }
+    }
+}
+'@
+}
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 $ErrorActionPreference = 'Stop'
@@ -55,6 +277,12 @@ $PoTokenProviderRoot = Join-Path $PoTokenRoot 'bgutil-ytdlp-pot-provider'
 $PoTokenPluginRoot = Join-Path $ToolsRoot 'yt-dlp-plugins'
 $PoTokenPluginZip = Join-Path $PoTokenPluginRoot 'bgutil-ytdlp-pot-provider.zip'
 $Script:ActiveProcess = $null
+$Script:DownloadJobHandle = [IntPtr]::Zero
+$Script:SuspendedDownloadPids = @()
+$Script:DownloadState = 'Idle'
+$Script:DownloadCancelled = $false
+$Script:DownloadContext = $null
+$Script:DownloadTimerBusy = $false
 $Script:LastPoTokenSetupLines = @()
 $Script:PoTokenProviderProcess = $null
 
@@ -123,7 +351,6 @@ function Stop-PoTokenProvider {
         Drain-PoTokenProviderOutput
         if (-not $Script:PoTokenProviderProcess.Process.HasExited) {
             $Script:PoTokenProviderProcess.Process.Kill()
-            $Script:PoTokenProviderProcess.Process.WaitForExit()
         }
         Drain-PoTokenProviderOutput
         Write-Log '[PO Token] Provider stopped'
@@ -593,25 +820,6 @@ function New-DownloadStatistics {
     }
 }
 
-function Test-PoTokenProviderHealthWithRetry($ProviderSession, $Statistics) {
-    if (Test-PoTokenProviderPing $ProviderSession.BaseUrl) { return $true }
-    if ($Script:PoTokenProviderProcess -and $Script:PoTokenProviderProcess.Process.HasExited) { return $false }
-    Write-Log '[PO Token] Temporary provider error: localhost /ping failed'
-    Write-Log '[PO Token] Retrying in 2 seconds...'
-    $Statistics.PoTokenRetryCount++
-    1..20 | ForEach-Object {
-        [System.Windows.Forms.Application]::DoEvents()
-        Start-Sleep -Milliseconds 100
-    }
-    if (Test-PoTokenProviderPing $ProviderSession.BaseUrl) {
-        Write-Log '[PO Token] Retry successful'
-        return $true
-    }
-    Write-Log '[PO Token] Retry failed'
-    Write-Log '[PO Token] Continuing according to existing error handling'
-    return $false
-}
-
 function Get-DownloadItemKey($Item) {
     if ($Item.playlist_index -and $Item.playlist_index -ne 'NA') { return "playlist:$($Item.playlist_index)" }
     if ($Item.id -and $Item.id -ne 'NA') { return "video:$($Item.id)" }
@@ -721,7 +929,7 @@ function Write-DownloadSummary($Statistics, [bool]$Stopped) {
     $processed = $Statistics.Items.Count
     $unprocessed = [Math]::Max(0, $total - $processed)
     Write-Log '=============================='
-    Write-Log $(if ($Stopped) { '下載已停止' } else { '下載完成摘要' })
+    Write-Log $(if ($Stopped) { '下載已終止' } else { '下載完成摘要' })
     Write-Log '=============================='
     Write-Log "總項目：$total"
     if ($Stopped) { Write-Log "已處理：$processed / $total" }
@@ -737,22 +945,285 @@ function Write-DownloadSummary($Statistics, [bool]$Stopped) {
     Write-Log '=============================='
 }
 
+function Close-DownloadJob {
+    if ($Script:DownloadJobHandle -ne [IntPtr]::Zero) {
+        [YtAudioDownloader.DownloadProcessController]::CloseJob($Script:DownloadJobHandle)
+        $Script:DownloadJobHandle = [IntPtr]::Zero
+    }
+}
+
+function Suspend-DownloadProcess {
+    if ($Script:DownloadState -ne 'Running') { return $false }
+    if (-not $Script:ActiveProcess -or $Script:ActiveProcess.HasExited) { return $false }
+    try {
+        $Script:SuspendedDownloadPids = @(
+            [YtAudioDownloader.DownloadProcessController]::SuspendTree($Script:ActiveProcess.Id)
+        )
+        $Script:DownloadState = 'Paused'
+        $cancelButton.Text = '已暫停'
+        Write-Log '[Download] Paused by user'
+        return $true
+    } catch {
+        $Script:SuspendedDownloadPids = @()
+        $Script:DownloadState = 'Running'
+        $cancelButton.Text = '停止'
+        Write-Log "[Download] Failed to pause process: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Resume-DownloadProcess {
+    if ($Script:DownloadState -ne 'Paused') { return $false }
+    try {
+        if (-not $Script:ActiveProcess -or $Script:ActiveProcess.HasExited) {
+            throw 'yt-dlp process 已經結束。'
+        }
+        [YtAudioDownloader.DownloadProcessController]::ResumeProcesses(
+            [int[]]$Script:SuspendedDownloadPids
+        )
+        $Script:SuspendedDownloadPids = @()
+        $Script:DownloadState = 'Running'
+        $cancelButton.Text = '停止'
+        Write-Log '[Download] Resumed by user'
+        return $true
+    } catch {
+        Write-Log "[Download] Failed to resume process: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Stop-DownloadProcessTree {
+    if ($Script:DownloadState -eq 'Stopping' -or $Script:DownloadState -eq 'Idle') { return }
+    if (-not $Script:ActiveProcess -or $Script:ActiveProcess.HasExited) { return }
+    $previousState = $Script:DownloadState
+    $Script:DownloadState = 'Stopping'
+    $Script:DownloadCancelled = $true
+    $cancelButton.Text = '結束中…'
+    $cancelButton.Enabled = $false
+    Write-Log '[Download] User requested termination'
+    Write-Log '[Download] Terminating current download process...'
+    $terminated = $false
+    try {
+        if ($Script:DownloadJobHandle -ne [IntPtr]::Zero) {
+            [YtAudioDownloader.DownloadProcessController]::TerminateJobAndTree(
+                $Script:DownloadJobHandle,
+                $Script:ActiveProcess.Id
+            )
+            $terminated = $true
+        } elseif ($Script:ActiveProcess -and -not $Script:ActiveProcess.HasExited) {
+            [YtAudioDownloader.DownloadProcessController]::TerminateTree($Script:ActiveProcess.Id)
+            $terminated = $true
+        }
+    } catch {
+        Write-Log "[Download] Failed to terminate process tree: $($_.Exception.Message)"
+        if ($Script:ActiveProcess -and -not $Script:ActiveProcess.HasExited) {
+            try {
+                [YtAudioDownloader.DownloadProcessController]::TerminateTree($Script:ActiveProcess.Id)
+                $terminated = $true
+            }
+            catch { Write-Log "[Download] Failed to terminate fallback process tree: $($_.Exception.Message)" }
+        }
+    }
+    if (-not $terminated -and $Script:ActiveProcess -and -not $Script:ActiveProcess.HasExited) {
+        $Script:DownloadCancelled = $false
+        $Script:DownloadState = $previousState
+        $cancelButton.Text = if ($previousState -eq 'Paused') { '已暫停' } else { '停止' }
+        $cancelButton.Enabled = $true
+    }
+}
+
+function Show-DownloadControlDialog {
+    if ($Script:DownloadState -eq 'Running') {
+        if (-not (Suspend-DownloadProcess)) { return }
+    } elseif ($Script:DownloadState -ne 'Paused') {
+        return
+    }
+    $newLine = [Environment]::NewLine
+    $message = '下載已暫停。' + $newLine + $newLine + '選擇「是」繼續下載。' + $newLine + '選擇「否」結束目前下載。'
+    $choice = [System.Windows.Forms.MessageBox]::Show(
+        $form,
+        $message,
+        '下載控制：是＝繼續，否＝結束',
+        [System.Windows.Forms.MessageBoxButtons]::YesNo,
+        [System.Windows.Forms.MessageBoxIcon]::Question
+    )
+    if ($choice -eq [System.Windows.Forms.DialogResult]::Yes) {
+        [void](Resume-DownloadProcess)
+    } else {
+        Stop-DownloadProcessTree
+    }
+}
+
+function Drain-DownloadProcessOutput($Context) {
+    if (-not $Context -or -not $Context.LoggedProcess) { return }
+    $queuedLine = $null
+    while ($Context.LoggedProcess.Lines.TryDequeue([ref]$queuedLine)) {
+        Write-DownloadProcessLine $queuedLine $Context.PreserveSource $Context.Statistics
+    }
+}
+
+function Start-ProviderHealthPing($Context, [bool]$IsRetry) {
+    try {
+        $request = [System.Net.HttpWebRequest]::Create($Context.ProviderSession.BaseUrl.TrimEnd('/') + '/ping')
+        $request.Method = 'GET'
+        $request.Timeout = 3000
+        $request.ReadWriteTimeout = 3000
+        $Context.HealthRequest = $request
+        $Context.HealthIsRetry = $IsRetry
+        $Context.HealthStarted = Get-Date
+        $Context.HealthAsync = $request.BeginGetResponse($null, $null)
+    } catch {
+        $Context.HealthRequest = $null
+        $Context.HealthAsync = $null
+        Complete-ProviderHealthPing $Context $false
+    }
+}
+
+function Stop-DownloadForProviderFailure($Context, [string]$Message) {
+    if ($Context.ProviderFailure) { return }
+    $Context.ProviderFailure = $Message
+    Write-Log "[PO Token] ERROR: $Message"
+    $Script:DownloadState = 'Stopping'
+    $cancelButton.Text = '結束中…'
+    $cancelButton.Enabled = $false
+    try {
+        if ($Script:DownloadJobHandle -ne [IntPtr]::Zero) {
+            [YtAudioDownloader.DownloadProcessController]::TerminateJobAndTree(
+                $Script:DownloadJobHandle,
+                $Script:ActiveProcess.Id
+            )
+        } elseif ($Script:ActiveProcess -and -not $Script:ActiveProcess.HasExited) {
+            [YtAudioDownloader.DownloadProcessController]::TerminateTree($Script:ActiveProcess.Id)
+        }
+    } catch {
+        Write-Log "[Download] Failed to terminate process tree: $($_.Exception.Message)"
+    }
+}
+
+function Complete-ProviderHealthPing($Context, [bool]$Succeeded) {
+    $wasRetry = [bool]$Context.HealthIsRetry
+    $Context.HealthRequest = $null
+    $Context.HealthAsync = $null
+    $Context.HealthStarted = $null
+    if ($Succeeded) {
+        if ($wasRetry) { Write-Log '[PO Token] Retry successful' }
+        $Context.HealthIsRetry = $false
+        $Context.RetryAt = $null
+        $Context.NextHealthCheck = (Get-Date).AddSeconds(5)
+        return
+    }
+    if (-not $wasRetry) {
+        Write-Log '[PO Token] Temporary provider error: localhost /ping failed'
+        Write-Log '[PO Token] Retrying in 2 seconds...'
+        $Context.Statistics.PoTokenRetryCount++
+        $Context.RetryAt = (Get-Date).AddSeconds(2)
+        return
+    }
+    Write-Log '[PO Token] Retry failed'
+    Write-Log '[PO Token] Continuing according to existing error handling'
+    Stop-DownloadForProviderFailure $Context 'PO Token provider 在播放清單下載期間無法通過 /ping 健康檢查；下載已停止，不會降級成 Auto client。'
+}
+
+function Update-ProviderHealth($Context) {
+    if (-not $Context.PreserveSource -or $Context.ProviderFailure) { return }
+    Drain-PoTokenProviderOutput
+    if ($Script:PoTokenProviderProcess -and $Script:PoTokenProviderProcess.Process.HasExited) {
+        Stop-DownloadForProviderFailure $Context "PO Token provider 在播放清單下載期間意外結束（exit code $($Script:PoTokenProviderProcess.Process.ExitCode)）；下載已停止，不會降級成 Auto client。"
+        return
+    }
+
+    $now = Get-Date
+    if ($Context.HealthAsync) {
+        if (-not $Context.HealthAsync.IsCompleted -and ($now - $Context.HealthStarted).TotalSeconds -lt 4) { return }
+        $succeeded = $false
+        try {
+            if (-not $Context.HealthAsync.IsCompleted) {
+                $Context.HealthRequest.Abort()
+            } else {
+                $response = $Context.HealthRequest.EndGetResponse($Context.HealthAsync)
+                try { $succeeded = [int]$response.StatusCode -ge 200 -and [int]$response.StatusCode -lt 300 }
+                finally { $response.Close() }
+            }
+        } catch { $succeeded = $false }
+        Complete-ProviderHealthPing $Context $succeeded
+        return
+    }
+    if ($Context.RetryAt) {
+        if ($now -ge $Context.RetryAt) { Start-ProviderHealthPing $Context $true }
+        return
+    }
+    if ($now -ge $Context.NextHealthCheck) { Start-ProviderHealthPing $Context $false }
+}
+
+function Complete-DownloadSession($Context) {
+    $downloadTimer.Stop()
+    Drain-DownloadProcessOutput $Context
+    if ($Context.PreserveSource) { Drain-PoTokenProviderOutput }
+    if ($Context.HealthRequest) {
+        try { $Context.HealthRequest.Abort() } catch { }
+    }
+    try {
+        if ($Context.ProviderFailure) {
+            Write-Log "錯誤：$($Context.ProviderFailure)"
+            [System.Windows.Forms.MessageBox]::Show($Context.ProviderFailure, '下載失敗', 'OK', 'Error') | Out-Null
+        } elseif ($Script:DownloadCancelled) {
+            Write-Log '[Download] Download terminated'
+        } elseif ($Script:ActiveProcess.ExitCode -eq 0) {
+            Write-Log '完成。'
+        } else {
+            Write-Log "下載結束，yt-dlp 結束代碼：$($Script:ActiveProcess.ExitCode)"
+        }
+    } finally {
+        Close-DownloadJob
+        if ($Context.ProviderSession) { Stop-PoTokenProvider }
+        Write-DownloadSummary $Context.Statistics $Script:DownloadCancelled
+        $Script:ActiveProcess = $null
+        $Script:SuspendedDownloadPids = @()
+        $Script:DownloadContext = $null
+        $Script:DownloadState = 'Idle'
+        $startButton.Enabled = $true
+        $cancelButton.Enabled = $false
+        $cancelButton.Text = '停止'
+    }
+}
+
+function Update-DownloadSession {
+    $context = $Script:DownloadContext
+    if (-not $context) { return }
+    try {
+        Drain-DownloadProcessOutput $context
+        if (-not $Script:ActiveProcess.HasExited) {
+            $context.ExitObservedAt = $null
+            Update-ProviderHealth $context
+            return
+        }
+        # Give asynchronous stdout/stderr callbacks a short, non-blocking grace
+        # period to enqueue the final lines before the summary is calculated.
+        if (-not $context.ExitObservedAt) {
+            $context.ExitObservedAt = Get-Date
+            return
+        }
+        if (((Get-Date) - $context.ExitObservedAt).TotalMilliseconds -lt 300) { return }
+        Complete-DownloadSession $context
+    } catch {
+        Write-Log "[Download] Monitor error: $($_.Exception.Message)"
+        Stop-DownloadForProviderFailure $context "下載監控失敗：$($_.Exception.Message)"
+    }
+}
+
 function Start-Download {
     $url = $urlBox.Text.Trim()
     if ([string]::IsNullOrWhiteSpace($url)) {
         [System.Windows.Forms.MessageBox]::Show('請貼上影片或播放清單網址。', '缺少網址', 'OK', 'Warning') | Out-Null
         return
     }
-    if ($Script:ActiveProcess -and -not $Script:ActiveProcess.HasExited) {
+    if ($Script:DownloadState -ne 'Idle' -or ($Script:ActiveProcess -and -not $Script:ActiveProcess.HasExited)) {
         [System.Windows.Forms.MessageBox]::Show('已有下載工作進行中。', '請稍候', 'OK', 'Information') | Out-Null
         return
     }
 
     $providerSession = $null
-    $providerFailure = $null
     $downloadStatistics = New-DownloadStatistics
-    $downloadProcessStarted = $false
-    $summaryWritten = $false
     $Script:DownloadCancelled = $false
     try {
         $startButton.Enabled = $false
@@ -847,61 +1318,45 @@ function Start-Download {
         $loggedProcess = [YtAudioDownloader.LoggedProcess]::new()
         $loggedProcess.Start($psi)
         $Script:ActiveProcess = $loggedProcess.Process
-        $downloadProcessStarted = $true
-        $nextProviderHealthCheck = (Get-Date).AddSeconds(5)
-        while (-not $Script:ActiveProcess.HasExited) {
-            $queuedLine = $null
-            while ($loggedProcess.Lines.TryDequeue([ref]$queuedLine)) {
-                Write-DownloadProcessLine $queuedLine $preserveSource $downloadStatistics
-            }
-            if ($preserveSource) {
-                Drain-PoTokenProviderOutput
-                if ($Script:PoTokenProviderProcess -and $Script:PoTokenProviderProcess.Process.HasExited) {
-                    $providerFailure = "PO Token provider 在播放清單下載期間意外結束（exit code $($Script:PoTokenProviderProcess.Process.ExitCode)）；下載已停止，不會降級成 Auto client。"
-                } elseif ((Get-Date) -ge $nextProviderHealthCheck) {
-                    if (-not (Test-PoTokenProviderHealthWithRetry $providerSession $downloadStatistics)) {
-                        $providerFailure = 'PO Token provider 在播放清單下載期間無法通過 /ping 健康檢查；下載已停止，不會降級成 Auto client。'
-                    }
-                    $nextProviderHealthCheck = (Get-Date).AddSeconds(5)
-                }
-                if ($providerFailure) {
-                    Write-Log "[PO Token] ERROR: $providerFailure"
-                    if (-not $Script:ActiveProcess.HasExited) { $Script:ActiveProcess.Kill() }
-                    break
-                }
-            }
-            [System.Windows.Forms.Application]::DoEvents()
-            Start-Sleep -Milliseconds 100
+        try {
+            $Script:DownloadJobHandle = [YtAudioDownloader.DownloadProcessController]::CreateKillOnCloseJob()
+            [YtAudioDownloader.DownloadProcessController]::AssignToJob(
+                $Script:DownloadJobHandle,
+                $Script:ActiveProcess.Handle
+            )
+        } catch {
+            if ($Script:DownloadJobHandle -ne [IntPtr]::Zero) { Close-DownloadJob }
+            [YtAudioDownloader.DownloadProcessController]::TerminateTree($Script:ActiveProcess.Id)
+            throw "無法建立下載 process Job Object：$($_.Exception.Message)"
         }
-        $Script:ActiveProcess.WaitForExit()
-        $queuedLine = $null
-        while ($loggedProcess.Lines.TryDequeue([ref]$queuedLine)) {
-            Write-DownloadProcessLine $queuedLine $preserveSource $downloadStatistics
+        $Script:DownloadState = 'Running'
+        $Script:DownloadContext = [pscustomobject]@{
+            LoggedProcess = $loggedProcess
+            PreserveSource = $preserveSource
+            ProviderSession = $providerSession
+            ProviderFailure = $null
+            Statistics = $downloadStatistics
+            NextHealthCheck = (Get-Date).AddSeconds(5)
+            RetryAt = $null
+            HealthRequest = $null
+            HealthAsync = $null
+            HealthIsRetry = $false
+            HealthStarted = $null
+            ExitObservedAt = $null
         }
-        if ($preserveSource) {
-            Drain-PoTokenProviderOutput
-            if (-not $providerFailure -and $Script:PoTokenProviderProcess -and $Script:PoTokenProviderProcess.Process.HasExited) {
-                $providerFailure = "PO Token provider 在 yt-dlp process 結束前後意外終止（exit code $($Script:PoTokenProviderProcess.Process.ExitCode)）；未使用 Auto client fallback。"
-                Write-Log "[PO Token] ERROR: $providerFailure"
-            } elseif (-not $providerFailure -and -not (Test-PoTokenProviderPing $providerSession.BaseUrl)) {
-                $providerFailure = 'PO Token provider 在 yt-dlp process 結束時無法通過 /ping 健康檢查；未使用 Auto client fallback。'
-                Write-Log "[PO Token] ERROR: $providerFailure"
-            }
-        }
-        if ($providerFailure) { throw $providerFailure }
-        if ($Script:ActiveProcess.ExitCode -eq 0) { Write-Log '完成。' } else { Write-Log "下載結束，yt-dlp 結束代碼：$($Script:ActiveProcess.ExitCode)" }
+        $downloadTimer.Start()
     } catch {
         Write-Log "錯誤：$($_.Exception.Message)"
         [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '下載失敗', 'OK', 'Error') | Out-Null
-    } finally {
+        Close-DownloadJob
         if ($providerSession) { Stop-PoTokenProvider }
-        if ($downloadProcessStarted -and -not $summaryWritten) {
-            Write-DownloadSummary $downloadStatistics $Script:DownloadCancelled
-            $summaryWritten = $true
-        }
         $Script:ActiveProcess = $null
+        $Script:SuspendedDownloadPids = @()
+        $Script:DownloadContext = $null
+        $Script:DownloadState = 'Idle'
         $startButton.Enabled = $true
         $cancelButton.Enabled = $false
+        $cancelButton.Text = '停止'
     }
 }
 
@@ -914,6 +1369,11 @@ $panel = [System.Windows.Forms.TableLayoutPanel]@{ Dock = 'Fill'; Padding = [Sys
 [void]$panel.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::AutoSize))
 $form.Controls.Add($panel)
 $form.Add_FormClosed({
+    if ($downloadTimer) { $downloadTimer.Stop() }
+    if ($Script:DownloadState -in @('Running', 'Paused')) {
+        Stop-DownloadProcessTree
+    }
+    Close-DownloadJob
     if ($Script:PoTokenProviderProcess -and -not $Script:PoTokenProviderProcess.Process.HasExited) {
         $Script:PoTokenProviderProcess.Process.Kill()
     }
@@ -965,9 +1425,17 @@ $startButton = [System.Windows.Forms.Button]@{ Text='開始下載'; AutoSize=$tr
 $cancelButton = [System.Windows.Forms.Button]@{ Text='停止'; AutoSize=$true; Enabled=$false }
 $openButton = [System.Windows.Forms.Button]@{ Text='開啟下載資料夾'; AutoSize=$true }
 $updateButton = [System.Windows.Forms.Button]@{ Text='更新 yt-dlp'; AutoSize=$true }
+$downloadTimer = [System.Windows.Forms.Timer]::new()
+$downloadTimer.Interval = 100
+$downloadTimer.Add_Tick({
+    if ($Script:DownloadTimerBusy) { return }
+    $Script:DownloadTimerBusy = $true
+    try { Update-DownloadSession }
+    finally { $Script:DownloadTimerBusy = $false }
+})
 $probeButton.Add_Click({ Check-Formats })
 $startButton.Add_Click({ Start-Download })
-$cancelButton.Add_Click({ if ($Script:ActiveProcess -and -not $Script:ActiveProcess.HasExited) { $Script:DownloadCancelled = $true; $Script:ActiveProcess.Kill(); Write-Log '已要求停止下載。' } })
+$cancelButton.Add_Click({ Show-DownloadControlDialog })
 $openButton.Add_Click({ New-Item -ItemType Directory -Force -Path $folderBox.Text | Out-Null; Start-Process explorer.exe $folderBox.Text })
 $updateButton.Add_Click({ Update-YtDlp })
 $buttonLine.Controls.AddRange(@($startButton,$cancelButton,$openButton,$updateButton)); $panel.Controls.Add($buttonLine,1,9)
