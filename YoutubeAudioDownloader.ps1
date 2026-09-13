@@ -96,6 +96,84 @@ function Protect-PoTokenLogLine([string]$Line) {
     return [regex]::Replace($Line, '(?i)((?:po[_ -]?token|pot|token)\s*(?:=|:|is)\s*)[^\s,;\]\}]+', '$1[REDACTED]')
 }
 
+function Test-PoTokenProviderPing([string]$BaseUrl = 'http://127.0.0.1:4416') {
+    try {
+        $response = Invoke-WebRequest -UseBasicParsing -Method Get -Uri ($BaseUrl.TrimEnd('/') + '/ping') -TimeoutSec 3
+        return $response.StatusCode -ge 200 -and $response.StatusCode -lt 300
+    } catch { return $false }
+}
+
+function Drain-PoTokenProviderOutput {
+    if (-not $Script:PoTokenProviderProcess) { return }
+    $line = $null
+    while ($Script:PoTokenProviderProcess.Lines.TryDequeue([ref]$line)) {
+        Write-Log "[PO Token] $(Protect-PoTokenLogLine $line)"
+    }
+    # LoggedProcess also keeps per-stream queues. Drain these duplicates so a
+    # long playlist does not retain provider output for the entire session.
+    foreach ($stream in @('OutputLines', 'ErrorLines')) {
+        $line = $null
+        while ($Script:PoTokenProviderProcess.$stream.TryDequeue([ref]$line)) { }
+    }
+}
+
+function Stop-PoTokenProvider {
+    if (-not $Script:PoTokenProviderProcess) { return }
+    try {
+        Drain-PoTokenProviderOutput
+        if (-not $Script:PoTokenProviderProcess.Process.HasExited) {
+            $Script:PoTokenProviderProcess.Process.Kill()
+            $Script:PoTokenProviderProcess.Process.WaitForExit()
+        }
+        Drain-PoTokenProviderOutput
+        Write-Log '[PO Token] Provider stopped'
+    } catch {
+        Write-Log "[PO Token] Provider stop warning: $($_.Exception.Message)"
+    } finally { $Script:PoTokenProviderProcess = $null }
+}
+
+function Ensure-PoTokenProviderRetryPatch([string]$PluginZip) {
+    $runtimeRoot = Join-Path $PoTokenRoot 'plugin-runtime'
+    New-Item -ItemType Directory -Force -Path $runtimeRoot | Out-Null
+    Expand-Archive -LiteralPath $PluginZip -DestinationPath $runtimeRoot -Force
+    $sourcePath = Join-Path $runtimeRoot 'yt_dlp_plugins\extractor\getpot_bgutil_http.py'
+    if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
+        throw '解壓後找不到 bgutil HTTP provider plugin。'
+    }
+    $source = Get-Content -LiteralPath $sourcePath -Raw
+    if (-not $source.Contains('def _request_webpage_with_retry(')) {
+        $anchor = '    def is_available(self):'
+        if (-not $source.Contains($anchor)) { throw 'bgutil HTTP plugin 版本無法套用有限次數 retry patch。' }
+        # Both calls in this provider target its configured localhost HTTP
+        # server. HTTP responses and parsing errors keep their original
+        # handling; only networking TransportError receives one delayed retry.
+        $source = $source.Replace('self._request_webpage(', 'self._request_webpage_with_retry(')
+        $retryMethod = @'
+    def _request_webpage_with_retry(self, request, **kwargs):
+        for attempt in range(2):
+            try:
+                response = self._request_webpage(request=request, **kwargs)
+                if attempt:
+                    self.logger.warning('[PO Token] Retry successful')
+                return response
+            except HTTPError:
+                raise
+            except TransportError as e:
+                if attempt:
+                    self.logger.warning('[PO Token] Retry failed')
+                    raise
+                self.logger.warning(f'[PO Token] Temporary provider error: {e!r}')
+                self.logger.warning('[PO Token] Retrying in 2 seconds...')
+                time.sleep(2)
+
+'@
+        $source = $source.Replace($anchor, $retryMethod + $anchor)
+        [System.IO.File]::WriteAllText($sourcePath, $source, [System.Text.UTF8Encoding]::new($false))
+    }
+    return $runtimeRoot
+}
+
+
 function Ensure-PoTokenProvider {
     $setupLines = [System.Collections.Generic.List[string]]::new()
     $Script:LastPoTokenSetupLines = @()
@@ -117,6 +195,7 @@ function Ensure-PoTokenProvider {
             Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/Brainicism/bgutil-ytdlp-pot-provider/releases/latest/download/bgutil-ytdlp-pot-provider.zip' -OutFile $PoTokenPluginZip
             $setupLines.Add('Plugin ZIP downloaded from the provider latest release.')
         }
+        $runtimePluginRoot = Ensure-PoTokenProviderRetryPatch $PoTokenPluginZip
         $nodeModules = Join-Path $serverRoot 'node_modules'
         if (-not (Test-Path -LiteralPath $nodeModules -PathType Container)) {
             Write-Log '[PO Token] 正在準備 bgutil Deno provider 依賴…'
@@ -126,8 +205,11 @@ function Ensure-PoTokenProvider {
             foreach ($line in $denoInstall.Stderr) { $setupLines.Add("[deno stderr] $(Protect-PoTokenLogLine $line)") }
             if ($denoInstall.ExitCode -ne 0) { throw "bgutil Deno provider 安裝失敗（exit code $($denoInstall.ExitCode)）。" }
         }
-        $serverReady = $false
-        try { $client = [System.Net.Sockets.TcpClient]::new('127.0.0.1', 4416); $client.Dispose(); $serverReady = $true } catch { }
+        if ($Script:PoTokenProviderProcess -and $Script:PoTokenProviderProcess.Process.HasExited) {
+            $Script:PoTokenProviderProcess = $null
+        }
+        $providerBaseUrl = 'http://127.0.0.1:4416'
+        $serverReady = Test-PoTokenProviderPing $providerBaseUrl
         if (-not $serverReady) {
             Write-Log '[PO Token] 正在啟動 localhost bgutil HTTP provider…'
             $psi = [System.Diagnostics.ProcessStartInfo]::new()
@@ -144,11 +226,7 @@ function Ensure-PoTokenProvider {
             $deadline = (Get-Date).AddSeconds(120)
             while ((Get-Date) -lt $deadline -and -not $serverReady -and -not $providerProcess.Process.HasExited) {
                 Start-Sleep -Milliseconds 250; [System.Windows.Forms.Application]::DoEvents()
-                $client = [System.Net.Sockets.TcpClient]::new()
-                try {
-                    $connect = $client.ConnectAsync('127.0.0.1', 4416)
-                    if ($connect.Wait(100)) { $serverReady = $client.Connected }
-                } catch { } finally { $client.Dispose() }
+                $serverReady = Test-PoTokenProviderPing $providerBaseUrl
                 $line = $null
                 while ($providerProcess.Lines.TryDequeue([ref]$line)) { $setupLines.Add("[provider] $(Protect-PoTokenLogLine $line)") }
                 if ($startupWatch.Elapsed.TotalSeconds -ge $nextUpdate -and -not $serverReady) {
@@ -171,10 +249,14 @@ function Ensure-PoTokenProvider {
                 throw "bgutil HTTP provider 未能在 localhost:4416 啟動（$exitDetail）。"
             }
         }
+        if (-not (Test-PoTokenProviderPing $providerBaseUrl)) {
+            throw 'bgutil HTTP provider 的 /ping 健康檢查失敗。'
+        }
         $setupLines.Add('bgutil HTTP provider ready at http://127.0.0.1:4416 (localhost only).')
-        return [pscustomobject]@{ PluginRoot = $PoTokenPluginRoot; BaseUrl = 'http://127.0.0.1:4416'; SetupLines = @($setupLines) }
+        return [pscustomobject]@{ PluginRoot = $runtimePluginRoot; BaseUrl = $providerBaseUrl; SetupLines = @($setupLines) }
     } catch {
         $Script:LastPoTokenSetupLines = @($setupLines)
+        if ($Script:PoTokenProviderProcess) { Stop-PoTokenProvider }
         throw
     }
 }
@@ -498,6 +580,163 @@ function Check-Formats {
     } finally { $probeButton.Enabled = $true }
 }
 
+function New-DownloadStatistics {
+    return [pscustomobject]@{
+        ExpectedTotal = 0
+        CurrentKey = $null
+        Items = [System.Collections.Generic.HashSet[string]]::new()
+        Success = [System.Collections.Generic.HashSet[string]]::new()
+        Failed = [System.Collections.Generic.HashSet[string]]::new()
+        Skipped = [System.Collections.Generic.HashSet[string]]::new()
+        SelectedByItem = [System.Collections.Generic.Dictionary[string,string]]::new()
+        PoTokenRetryCount = 0
+    }
+}
+
+function Test-PoTokenProviderHealthWithRetry($ProviderSession, $Statistics) {
+    if (Test-PoTokenProviderPing $ProviderSession.BaseUrl) { return $true }
+    if ($Script:PoTokenProviderProcess -and $Script:PoTokenProviderProcess.Process.HasExited) { return $false }
+    Write-Log '[PO Token] Temporary provider error: localhost /ping failed'
+    Write-Log '[PO Token] Retrying in 2 seconds...'
+    $Statistics.PoTokenRetryCount++
+    1..20 | ForEach-Object {
+        [System.Windows.Forms.Application]::DoEvents()
+        Start-Sleep -Milliseconds 100
+    }
+    if (Test-PoTokenProviderPing $ProviderSession.BaseUrl) {
+        Write-Log '[PO Token] Retry successful'
+        return $true
+    }
+    Write-Log '[PO Token] Retry failed'
+    Write-Log '[PO Token] Continuing according to existing error handling'
+    return $false
+}
+
+function Get-DownloadItemKey($Item) {
+    if ($Item.playlist_index -and $Item.playlist_index -ne 'NA') { return "playlist:$($Item.playlist_index)" }
+    if ($Item.id -and $Item.id -ne 'NA') { return "video:$($Item.id)" }
+    return 'video:1'
+}
+
+function Write-PreferredFormatSelectionLog([string]$Line, $Statistics = $null) {
+    $prefix = '__YAD_PREFERRED_FORMAT__'
+    if (-not $Line.StartsWith($prefix, [System.StringComparison]::Ordinal)) {
+        Write-Log $Line
+        return
+    }
+
+    try {
+        $item = $Line.Substring($prefix.Length) | ConvertFrom-Json
+        $position = if ($item.playlist_index -and $item.playlist_index -ne 'NA') { [string]$item.playlist_index } else { '1' }
+        $total = if ($item.playlist_count -and $item.playlist_count -ne 'NA') { [string]$item.playlist_count } elseif ($item.n_entries -and $item.n_entries -ne 'NA') { [string]$item.n_entries } else { '1' }
+        $audioIds = @($item.formats | Where-Object {
+            $_.vcodec -eq 'none' -and $_.acodec -and $_.acodec -ne 'none'
+        } | ForEach-Object { [string]$_.format_id })
+        $available = @('774', '141', '251') | Where-Object { $audioIds -contains $_ }
+        $availableText = if ($available.Count) { $available -join ', ' } else { 'none' }
+        Write-Log "[$position/$total] Available preferred formats: $availableText"
+
+        $selectedId = [string]$item.format_id
+        if ($Statistics) {
+            $key = Get-DownloadItemKey $item
+            [void]$Statistics.Items.Add($key)
+            $Statistics.CurrentKey = $key
+            $Statistics.SelectedByItem[$key] = $selectedId
+            $reportedTotal = if ($item.playlist_count -and $item.playlist_count -ne 'NA') { [int]$item.playlist_count } elseif ($item.n_entries -and $item.n_entries -ne 'NA') { [int]$item.n_entries } else { 1 }
+            if ($reportedTotal -gt $Statistics.ExpectedTotal) { $Statistics.ExpectedTotal = $reportedTotal }
+        }
+        if ($selectedId -in @('774', '141', '251')) {
+            Write-Log "[$position/$total] Selected format: $selectedId"
+            if ($selectedId -eq '141') {
+                Write-Log "[$position/$total] Output: .m4a (original AAC; no audio re-encoding)"
+            } else {
+                Write-Log "[$position/$total] Output: .opus (original Opus; remux only, no audio re-encoding)"
+            }
+        } else {
+            Write-Log "[$position/$total] No preferred format available; fallback selected: $selectedId"
+            Write-Log "[$position/$total] Fallback keeps the original audio; no lossy re-encoding"
+        }
+    } catch {
+        Write-Log "[Selection] 無法解析每首格式選擇紀錄：$($_.Exception.Message)"
+    }
+}
+
+function Write-DownloadProcessLine([string]$Line, [bool]$PreserveSource, $Statistics) {
+    if ($Line.StartsWith('__YAD_PREFERRED_FORMAT__', [System.StringComparison]::Ordinal)) {
+        Write-PreferredFormatSelectionLog $Line $Statistics
+        return
+    }
+    if ($Line.StartsWith('__YAD_ITEM_START__', [System.StringComparison]::Ordinal)) {
+        try {
+            $item = $Line.Substring('__YAD_ITEM_START__'.Length) | ConvertFrom-Json
+            $key = Get-DownloadItemKey $item
+            [void]$Statistics.Items.Add($key)
+            $Statistics.CurrentKey = $key
+            $Statistics.SelectedByItem[$key] = [string]$item.format_id
+            $reportedTotal = if ($item.playlist_count -and $item.playlist_count -ne 'NA') { [int]$item.playlist_count } elseif ($item.n_entries -and $item.n_entries -ne 'NA') { [int]$item.n_entries } else { 1 }
+            if ($reportedTotal -gt $Statistics.ExpectedTotal) { $Statistics.ExpectedTotal = $reportedTotal }
+        } catch { Write-Log "[Summary] 無法解析項目開始紀錄：$($_.Exception.Message)" }
+        return
+    }
+    if ($Line.StartsWith('__YAD_ITEM_SUCCESS__', [System.StringComparison]::Ordinal)) {
+        try {
+            $item = $Line.Substring('__YAD_ITEM_SUCCESS__'.Length) | ConvertFrom-Json
+            $key = Get-DownloadItemKey $item
+            [void]$Statistics.Items.Add($key)
+            if (-not $Statistics.Skipped.Contains($key)) { [void]$Statistics.Success.Add($key) }
+            [void]$Statistics.Failed.Remove($key)
+        } catch { Write-Log "[Summary] 無法解析項目完成紀錄：$($_.Exception.Message)" }
+        return
+    }
+    if ($Line -match '(?i)\[download\]\s+Downloading item\s+(\d+)\s+of\s+(\d+)') {
+        $key = "playlist:$($Matches[1])"
+        $Statistics.CurrentKey = $key
+        [void]$Statistics.Items.Add($key)
+        $reportedTotal = [int]$Matches[2]
+        if ($reportedTotal -gt $Statistics.ExpectedTotal) { $Statistics.ExpectedTotal = $reportedTotal }
+    }
+    if ($Statistics.CurrentKey -and $Line -match '(?i)has already been downloaded|has already been recorded in the archive|\[download\].*skipping') {
+        [void]$Statistics.Skipped.Add($Statistics.CurrentKey)
+        [void]$Statistics.Success.Remove($Statistics.CurrentKey)
+    }
+    if ($Statistics.CurrentKey -and $Line -match '(?i)^ERROR:' -and $Line -notmatch '(?i)PO Token|bgutil|localhost|ConnectionReset|transport') {
+        [void]$Statistics.Failed.Add($Statistics.CurrentKey)
+    }
+    if ($Line -match '\[PO Token\] Retrying in 2 seconds') { $Statistics.PoTokenRetryCount++ }
+    Write-Log $Line
+}
+
+function Write-DownloadSummary($Statistics, [bool]$Stopped) {
+    $total = if ($Statistics.ExpectedTotal -gt 0) { $Statistics.ExpectedTotal } elseif ($Statistics.Items.Count -gt 0) { $Statistics.Items.Count } else { 1 }
+    if (-not $Stopped) {
+        foreach ($key in $Statistics.Items) {
+            if (-not $Statistics.Success.Contains($key) -and -not $Statistics.Skipped.Contains($key)) { [void]$Statistics.Failed.Add($key) }
+        }
+    }
+    $counts = @{ '774' = 0; '141' = 0; '251' = 0; 'fallback' = 0 }
+    foreach ($key in $Statistics.Success) {
+        $selected = if ($Statistics.SelectedByItem.ContainsKey($key)) { $Statistics.SelectedByItem[$key] } else { '' }
+        if ($selected -in @('774', '141', '251')) { $counts[$selected]++ } else { $counts['fallback']++ }
+    }
+    $processed = $Statistics.Items.Count
+    $unprocessed = [Math]::Max(0, $total - $processed)
+    Write-Log '=============================='
+    Write-Log $(if ($Stopped) { '下載已停止' } else { '下載完成摘要' })
+    Write-Log '=============================='
+    Write-Log "總項目：$total"
+    if ($Stopped) { Write-Log "已處理：$processed / $total" }
+    Write-Log "成功：$($Statistics.Success.Count)"
+    Write-Log "774：$($counts['774'])"
+    Write-Log "141：$($counts['141'])"
+    Write-Log "251：$($counts['251'])"
+    Write-Log "其他來源音訊：$($counts['fallback'])"
+    Write-Log "失敗：$($Statistics.Failed.Count)"
+    Write-Log "跳過：$($Statistics.Skipped.Count)"
+    if ($Stopped) { Write-Log "未處理：$unprocessed" }
+    Write-Log "PO Token Retry：$($Statistics.PoTokenRetryCount)"
+    Write-Log '=============================='
+}
+
 function Start-Download {
     $url = $urlBox.Text.Trim()
     if ([string]::IsNullOrWhiteSpace($url)) {
@@ -509,6 +748,12 @@ function Start-Download {
         return
     }
 
+    $providerSession = $null
+    $providerFailure = $null
+    $downloadStatistics = New-DownloadStatistics
+    $downloadProcessStarted = $false
+    $summaryWritten = $false
+    $Script:DownloadCancelled = $false
     try {
         $startButton.Enabled = $false
         $cancelButton.Enabled = $true
@@ -530,29 +775,31 @@ function Start-Download {
         Add-YtDlpAccessArguments $args
         $downloadClient = 'Auto'
         $formatSelector = 'bestaudio/best'
-        $useOriginalOpus = $format -eq 'opus' -and $qualityMode -eq '保留來源最佳品質'
-        if ($useOriginalOpus) {
-            $probe = Get-AudioFormatProbe $url
-            if ($probe.Selected) {
-                $selected = $probe.Selected
-                $downloadClient = $selected.Client
-                $formatSelector = $selected.BestOpus.format_id
-                if ($selected.Client -ne 'Auto') {
-                    $args.Add('--extractor-args'); $args.Add("youtube:player_client=$($selected.Client)")
-                }
-                $args.Add('-f'); $args.Add($selected.BestOpus.format_id)
-                $args.Add('--remux-video'); $args.Add('opus')
-                Write-Log "[Download] Using $($selected.Client) original Opus format $($selected.BestOpus.format_id)"
-                Write-Log '[Remux] No audio re-encoding'
-            } else {
-                Write-Log '[Download] 沒有找到原始 Opus 格式；不會默默重新編碼。'
-                $fallback = [System.Windows.Forms.MessageBox]::Show(
-                    '此影片沒有原始 Opus 音訊。要改下載最佳可用原始音訊（不轉碼，副檔名可能不是 .opus）嗎？',
-                    '找不到原始 Opus', 'YesNo', 'Warning')
-                if ($fallback -ne 'Yes') { Write-Log '[Download] 使用者取消 fallback。'; return }
-                $args.Add('-f'); $args.Add('bestaudio/best')
-                Write-Log '[Download] Fallback to best available original audio; no audio re-encoding.'
+        $preserveSource = $qualityMode -eq '保留來源最佳品質'
+        if ($preserveSource) {
+            $providerSession = Ensure-PoTokenProvider
+            if (-not (Test-PoTokenProviderPing $providerSession.BaseUrl)) {
+                throw 'PO Token provider 未通過 /ping 健康檢查；不會以 Auto client 繼續。'
             }
+            Drain-PoTokenProviderOutput
+            $downloadClient = 'web_music'
+            $args.Add('--plugin-dirs'); $args.Add($providerSession.PluginRoot)
+            $args.Add('--extractor-args'); $args.Add('youtube:player_client=web_music')
+            $args.Add('--extractor-args'); $args.Add("youtubepot-bgutilhttp:base_url=$($providerSession.BaseUrl)")
+            Write-Log '[Client] web_music'
+            Write-Log '[PO Token] Provider ready'
+            # yt-dlp evaluates slash-separated alternatives again for every
+            # playlist item, so no format selected for one item is reused by
+            # the next item. The final alternatives retain the existing
+            # best-original-audio fallback without lossy conversion.
+            $formatSelector = '774/141/251/bestaudio/best'
+            $args.Add('-f'); $args.Add($formatSelector)
+            # Remux only WebM sources (774/251) to an Opus container. Format
+            # 141 is already AAC/m4a and is intentionally left unchanged.
+            $args.Add('--remux-video'); $args.Add('webm>opus')
+            $args.Add('--print'); $args.Add('before_dl:__YAD_PREFERRED_FORMAT__%(.{id,playlist_index,playlist_count,n_entries,format_id,ext,acodec,formats})j')
+            Write-Log '[Download] Per-item source priority: 774 > 141 > 251 > original-audio fallback'
+            Write-Log '[Remux] WebM Opus becomes .opus; format 141 remains original AAC in .m4a; no audio re-encoding'
         } else {
             $args.Add('-f'); $args.Add('bestaudio/best')
             $args.Add('-x')
@@ -560,8 +807,11 @@ function Start-Download {
             if ($format -notin @('flac', 'wav')) {
                 $args.Add('--audio-quality'); $args.Add($quality)
             }
+            $args.Add('--print'); $args.Add('before_dl:__YAD_ITEM_START__%(.{id,playlist_index,playlist_count,n_entries,format_id})j')
             Write-Log "[Download] Re-encoding or codec conversion to $format ($qualityLabel)"
         }
+        $args.Add('--print'); $args.Add('after_move:__YAD_ITEM_SUCCESS__%(.{id,playlist_index,playlist_count,n_entries,format_id})j')
+        $args.Add('--progress')
         $args.Add('-o'); $args.Add((Join-Path $destination '%(playlist_index&{} - |)s%(title)s [%(id)s].%(ext)s'))
         if ($playlistCheck.Checked) { $args.Add('--yes-playlist') } else { $args.Add('--no-playlist') }
         $args.Add($url)
@@ -597,20 +847,58 @@ function Start-Download {
         $loggedProcess = [YtAudioDownloader.LoggedProcess]::new()
         $loggedProcess.Start($psi)
         $Script:ActiveProcess = $loggedProcess.Process
+        $downloadProcessStarted = $true
+        $nextProviderHealthCheck = (Get-Date).AddSeconds(5)
         while (-not $Script:ActiveProcess.HasExited) {
             $queuedLine = $null
-            while ($loggedProcess.Lines.TryDequeue([ref]$queuedLine)) { Write-Log $queuedLine }
+            while ($loggedProcess.Lines.TryDequeue([ref]$queuedLine)) {
+                Write-DownloadProcessLine $queuedLine $preserveSource $downloadStatistics
+            }
+            if ($preserveSource) {
+                Drain-PoTokenProviderOutput
+                if ($Script:PoTokenProviderProcess -and $Script:PoTokenProviderProcess.Process.HasExited) {
+                    $providerFailure = "PO Token provider 在播放清單下載期間意外結束（exit code $($Script:PoTokenProviderProcess.Process.ExitCode)）；下載已停止，不會降級成 Auto client。"
+                } elseif ((Get-Date) -ge $nextProviderHealthCheck) {
+                    if (-not (Test-PoTokenProviderHealthWithRetry $providerSession $downloadStatistics)) {
+                        $providerFailure = 'PO Token provider 在播放清單下載期間無法通過 /ping 健康檢查；下載已停止，不會降級成 Auto client。'
+                    }
+                    $nextProviderHealthCheck = (Get-Date).AddSeconds(5)
+                }
+                if ($providerFailure) {
+                    Write-Log "[PO Token] ERROR: $providerFailure"
+                    if (-not $Script:ActiveProcess.HasExited) { $Script:ActiveProcess.Kill() }
+                    break
+                }
+            }
             [System.Windows.Forms.Application]::DoEvents()
             Start-Sleep -Milliseconds 100
         }
         $Script:ActiveProcess.WaitForExit()
         $queuedLine = $null
-        while ($loggedProcess.Lines.TryDequeue([ref]$queuedLine)) { Write-Log $queuedLine }
+        while ($loggedProcess.Lines.TryDequeue([ref]$queuedLine)) {
+            Write-DownloadProcessLine $queuedLine $preserveSource $downloadStatistics
+        }
+        if ($preserveSource) {
+            Drain-PoTokenProviderOutput
+            if (-not $providerFailure -and $Script:PoTokenProviderProcess -and $Script:PoTokenProviderProcess.Process.HasExited) {
+                $providerFailure = "PO Token provider 在 yt-dlp process 結束前後意外終止（exit code $($Script:PoTokenProviderProcess.Process.ExitCode)）；未使用 Auto client fallback。"
+                Write-Log "[PO Token] ERROR: $providerFailure"
+            } elseif (-not $providerFailure -and -not (Test-PoTokenProviderPing $providerSession.BaseUrl)) {
+                $providerFailure = 'PO Token provider 在 yt-dlp process 結束時無法通過 /ping 健康檢查；未使用 Auto client fallback。'
+                Write-Log "[PO Token] ERROR: $providerFailure"
+            }
+        }
+        if ($providerFailure) { throw $providerFailure }
         if ($Script:ActiveProcess.ExitCode -eq 0) { Write-Log '完成。' } else { Write-Log "下載結束，yt-dlp 結束代碼：$($Script:ActiveProcess.ExitCode)" }
     } catch {
         Write-Log "錯誤：$($_.Exception.Message)"
         [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '下載失敗', 'OK', 'Error') | Out-Null
     } finally {
+        if ($providerSession) { Stop-PoTokenProvider }
+        if ($downloadProcessStarted -and -not $summaryWritten) {
+            Write-DownloadSummary $downloadStatistics $Script:DownloadCancelled
+            $summaryWritten = $true
+        }
         $Script:ActiveProcess = $null
         $startButton.Enabled = $true
         $cancelButton.Enabled = $false
@@ -639,16 +927,20 @@ $probeButton = [System.Windows.Forms.Button]@{ Text='檢查可用品質'; AutoSi
 $urlLine.Controls.AddRange(@($urlBox,$probeButton)); $panel.Controls.Add($urlLine,1,0)
 Add-Label '下載範圍' 1
 $playlistCheck = [System.Windows.Forms.CheckBox]@{ Text='下載整個播放清單（取消勾選即只下載此影片）'; Checked=$true; AutoSize=$true; Margin=[System.Windows.Forms.Padding]::new(3,7,3,7) }; $panel.Controls.Add($playlistCheck,1,1)
-Add-Label '音訊格式' 2
-$formatBox = [System.Windows.Forms.ComboBox]@{ DropDownStyle='DropDownList'; Width=170 }; [void]$formatBox.Items.AddRange(@('opus','mp3','m4a','flac','wav')); $formatBox.SelectedItem='opus'; $panel.Controls.Add($formatBox,1,2)
-Add-Label '品質模式' 3
-$qualityModeBox = [System.Windows.Forms.ComboBox]@{ DropDownStyle='DropDownList'; Width=220 }; [void]$qualityModeBox.Items.AddRange(@('保留來源最佳品質','重新編碼')); $qualityModeBox.SelectedIndex=0; $panel.Controls.Add($qualityModeBox,1,3)
+Add-Label '品質模式' 2
+$qualityModeLine = [System.Windows.Forms.FlowLayoutPanel]@{ Dock='Fill'; AutoSize=$true; WrapContents=$false }
+$qualityModeBox = [System.Windows.Forms.ComboBox]@{ DropDownStyle='DropDownList'; Width=220 }; [void]$qualityModeBox.Items.AddRange(@('保留來源最佳品質','重新編碼')); $qualityModeBox.SelectedIndex=0
+$sourcePriorityLabel = [System.Windows.Forms.Label]@{ Text='優先：774 → 141 → 251'; AutoSize=$true; ForeColor=[System.Drawing.Color]::DimGray; Font=[System.Drawing.Font]::new('Microsoft JhengHei UI',9); Margin=[System.Windows.Forms.Padding]::new(10,6,3,3) }
+$qualityModeLine.Controls.AddRange(@($qualityModeBox,$sourcePriorityLabel)); $panel.Controls.Add($qualityModeLine,1,2)
+Add-Label '音訊格式' 3
+$formatBox = [System.Windows.Forms.ComboBox]@{ DropDownStyle='DropDownList'; Width=170 }; [void]$formatBox.Items.AddRange(@('opus','mp3','m4a','flac','wav')); $formatBox.SelectedItem='opus'; $panel.Controls.Add($formatBox,1,3)
 Add-Label '轉碼品質' 4
 $qualityBox = [System.Windows.Forms.ComboBox]@{ DropDownStyle='DropDownList'; Width=170 }; [void]$qualityBox.Items.AddRange(@('0（最佳）','64K','96K','128K','160K','192K','256K','320K')); $qualityBox.SelectedItem='0（最佳）'; $panel.Controls.Add($qualityBox,1,4)
 function Update-QualityControls {
-    $qualityBox.Enabled = $qualityModeBox.SelectedItem -eq '重新編碼'
+    $reencode = $qualityModeBox.SelectedItem -eq '重新編碼'
+    $formatBox.Enabled = $reencode
+    $qualityBox.Enabled = $reencode
 }
-$formatBox.Add_SelectedIndexChanged({ Update-QualityControls })
 $qualityModeBox.Add_SelectedIndexChanged({ Update-QualityControls })
 Update-QualityControls
 Add-Label '登入瀏覽器' 5
@@ -675,10 +967,10 @@ $openButton = [System.Windows.Forms.Button]@{ Text='開啟下載資料夾'; Auto
 $updateButton = [System.Windows.Forms.Button]@{ Text='更新 yt-dlp'; AutoSize=$true }
 $probeButton.Add_Click({ Check-Formats })
 $startButton.Add_Click({ Start-Download })
-$cancelButton.Add_Click({ if ($Script:ActiveProcess -and -not $Script:ActiveProcess.HasExited) { $Script:ActiveProcess.Kill(); Write-Log '已要求停止下載。' } })
+$cancelButton.Add_Click({ if ($Script:ActiveProcess -and -not $Script:ActiveProcess.HasExited) { $Script:DownloadCancelled = $true; $Script:ActiveProcess.Kill(); Write-Log '已要求停止下載。' } })
 $openButton.Add_Click({ New-Item -ItemType Directory -Force -Path $folderBox.Text | Out-Null; Start-Process explorer.exe $folderBox.Text })
 $updateButton.Add_Click({ Update-YtDlp })
 $buttonLine.Controls.AddRange(@($startButton,$cancelButton,$openButton,$updateButton)); $panel.Controls.Add($buttonLine,1,9)
 
-Write-Log '就緒。選擇 Opus + 0（最佳）可保留最高可用音訊品質。'
+Write-Log '就緒。保留來源最佳品質時，依序優先使用 774 → 141 → 251；只有「重新編碼」模式才會套用音訊格式與轉碼品質設定。'
 [void]$form.ShowDialog()
