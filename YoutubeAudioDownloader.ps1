@@ -276,6 +276,8 @@ $PoTokenRoot = Join-Path $ToolsRoot 'po-token-provider'
 $PoTokenProviderRoot = Join-Path $PoTokenRoot 'bgutil-ytdlp-pot-provider'
 $PoTokenPluginRoot = Join-Path $ToolsRoot 'yt-dlp-plugins'
 $PoTokenPluginZip = Join-Path $PoTokenPluginRoot 'bgutil-ytdlp-pot-provider.zip'
+$MetadataPluginRoot = Join-Path $AppRoot 'plugins'
+$SourceMetadataPlugin = Join-Path $MetadataPluginRoot 'source-metadata\yt_dlp_plugins\postprocessor\source_metadata.py'
 $Script:ActiveProcess = $null
 $Script:DownloadJobHandle = [IntPtr]::Zero
 $Script:SuspendedDownloadPids = @()
@@ -525,6 +527,9 @@ function Ensure-Tools {
             if (Test-Path $zip) { Remove-Item -LiteralPath $zip -Force }
             if ($extract -and (Test-Path $extract)) { Remove-Item -LiteralPath $extract -Recurse -Force }
         }
+    }
+    if (-not (Test-Path -LiteralPath $SourceMetadataPlugin -PathType Leaf)) {
+        throw "找不到來源 metadata plugin：$SourceMetadataPlugin"
     }
 }
 
@@ -817,7 +822,16 @@ function New-DownloadStatistics {
         Skipped = [System.Collections.Generic.HashSet[string]]::new()
         SelectedByItem = [System.Collections.Generic.Dictionary[string,string]]::new()
         PoTokenRetryCount = 0
+        JobFailureCategory = $null
+        JobFailureReason = $null
+        BrowserCookieErrorReported = $false
+        AuthenticationFailureStopRequested = $false
     }
+}
+
+function Test-BrowserCookieDatabaseLocked([string]$Line) {
+    if ([string]::IsNullOrWhiteSpace($Line)) { return $false }
+    return $Line -match '(?i)((?:could\s+not|failed\s+to|unable\s+to)\s+(?:copy|access|open|read)\s+(?:the\s+)?(?:google\s+)?chrome\s+cookies?\s+database|chrome[^\r\n]*cookies?\s+database[^\r\n]*(?:locked|lock|permission|access\s+denied|copy\s+failed)|(?:permission\s+denied|access\s+is\s+denied|database\s+is\s+locked)[^\r\n]*chrome[^\r\n]*cookies?)'
 }
 
 function Get-DownloadItemKey($Item) {
@@ -870,6 +884,17 @@ function Write-PreferredFormatSelectionLog([string]$Line, $Statistics = $null) {
 }
 
 function Write-DownloadProcessLine([string]$Line, [bool]$PreserveSource, $Statistics) {
+    if (Test-BrowserCookieDatabaseLocked $Line) {
+        $Statistics.JobFailureCategory = 'BrowserCookieDatabaseLocked'
+        $Statistics.JobFailureReason = 'Chrome Cookie database 無法存取'
+        if (-not $Statistics.BrowserCookieErrorReported) {
+            $Statistics.BrowserCookieErrorReported = $true
+            Write-Log '[Auth Error] 無法讀取 Chrome Cookie 資料庫。'
+            Write-Log '[Auth Error] Chrome 可能仍在執行並鎖定 Cookies database。'
+            Write-Log '[Auth Error] 請完全關閉 Chrome（包含背景 chrome.exe）後再重試。'
+            Write-Log '[Auth Error] 或改用匯出的 cookies.txt。'
+        }
+    }
     if ($Line.StartsWith('__YAD_PREFERRED_FORMAT__', [System.StringComparison]::Ordinal)) {
         Write-PreferredFormatSelectionLog $Line $Statistics
         return
@@ -914,7 +939,23 @@ function Write-DownloadProcessLine([string]$Line, [bool]$PreserveSource, $Statis
     Write-Log $Line
 }
 
-function Write-DownloadSummary($Statistics, [bool]$Stopped) {
+function Write-DownloadSummary($Statistics, [bool]$Stopped, [bool]$ProcessFailed, [bool]$PlaylistRequested) {
+    if (-not $Stopped -and $ProcessFailed -and $PlaylistRequested -and
+        $Statistics.ExpectedTotal -le 0 -and $Statistics.Items.Count -eq 0) {
+        Write-Log '=============================='
+        Write-Log '下載工作失敗'
+        Write-Log '=============================='
+        if ($Statistics.JobFailureReason) { Write-Log "原因：$($Statistics.JobFailureReason)" }
+        Write-Log '已成功下載：0'
+        Write-Log "PO Token Retry：$($Statistics.PoTokenRetryCount)"
+        Write-Log '=============================='
+        return
+    }
+    if (-not $Stopped -and $ProcessFailed -and $Statistics.Items.Count -eq 0) {
+        [void]$Statistics.Items.Add('job:1')
+        [void]$Statistics.Failed.Add('job:1')
+        if ($Statistics.ExpectedTotal -le 0) { $Statistics.ExpectedTotal = 1 }
+    }
     $total = if ($Statistics.ExpectedTotal -gt 0) { $Statistics.ExpectedTotal } elseif ($Statistics.Items.Count -gt 0) { $Statistics.Items.Count } else { 1 }
     if (-not $Stopped) {
         foreach ($key in $Statistics.Items) {
@@ -1100,6 +1141,26 @@ function Stop-DownloadForProviderFailure($Context, [string]$Message) {
     }
 }
 
+function Stop-DownloadForAuthenticationFailure($Context) {
+    if ($Context.Statistics.AuthenticationFailureStopRequested) { return }
+    $Context.Statistics.AuthenticationFailureStopRequested = $true
+    $Script:DownloadState = 'Stopping'
+    $cancelButton.Text = '結束中…'
+    $cancelButton.Enabled = $false
+    try {
+        if ($Script:DownloadJobHandle -ne [IntPtr]::Zero) {
+            [YtAudioDownloader.DownloadProcessController]::TerminateJobAndTree(
+                $Script:DownloadJobHandle,
+                $Script:ActiveProcess.Id
+            )
+        } elseif ($Script:ActiveProcess -and -not $Script:ActiveProcess.HasExited) {
+            [YtAudioDownloader.DownloadProcessController]::TerminateTree($Script:ActiveProcess.Id)
+        }
+    } catch {
+        Write-Log "[Auth Error] 無法終止失敗的 yt-dlp process：$($_.Exception.Message)"
+    }
+}
+
 function Complete-ProviderHealthPing($Context, [bool]$Succeeded) {
     $wasRetry = [bool]$Context.HealthIsRetry
     $Context.HealthRequest = $null
@@ -1162,6 +1223,11 @@ function Complete-DownloadSession($Context) {
     if ($Context.HealthRequest) {
         try { $Context.HealthRequest.Abort() } catch { }
     }
+    $processFailed = (
+        [bool]$Context.ProviderFailure -or
+        [bool]$Context.Statistics.JobFailureCategory -or
+        $Script:ActiveProcess.ExitCode -ne 0
+    )
     try {
         if ($Context.ProviderFailure) {
             Write-Log "錯誤：$($Context.ProviderFailure)"
@@ -1176,7 +1242,7 @@ function Complete-DownloadSession($Context) {
     } finally {
         Close-DownloadJob
         if ($Context.ProviderSession) { Stop-PoTokenProvider }
-        Write-DownloadSummary $Context.Statistics $Script:DownloadCancelled
+        Write-DownloadSummary $Context.Statistics $Script:DownloadCancelled $processFailed $Context.PlaylistRequested
         $Script:ActiveProcess = $null
         $Script:SuspendedDownloadPids = @()
         $Script:DownloadContext = $null
@@ -1192,6 +1258,11 @@ function Update-DownloadSession {
     if (-not $context) { return }
     try {
         Drain-DownloadProcessOutput $context
+        if ($context.Statistics.JobFailureCategory -eq 'BrowserCookieDatabaseLocked' -and
+            -not $Script:ActiveProcess.HasExited) {
+            Stop-DownloadForAuthenticationFailure $context
+            return
+        }
         if (-not $Script:ActiveProcess.HasExited) {
             $context.ExitObservedAt = $null
             Update-ProviderHealth $context
@@ -1244,6 +1315,15 @@ function Start-Download {
         $args.Add('--ignore-errors')
         $args.Add('--windows-filenames')
         Add-YtDlpAccessArguments $args
+        $selectedBrowser = $null
+        if (-not $cookieFileBox.Text.Trim() -and $browserBox.SelectedIndex -gt 0) {
+            $selectedBrowser = $browserBox.SelectedItem.ToString().ToLowerInvariant()
+        }
+        if ($selectedBrowser -eq 'chrome' -and @(Get-Process -Name 'chrome' -ErrorAction SilentlyContinue).Count -gt 0) {
+            Write-Log '[Auth Warning] 偵測到 Chrome 正在執行。'
+            Write-Log '[Auth Warning] yt-dlp 在 Windows 上可能無法複製 Chrome Cookie database。'
+            Write-Log '[Auth Warning] 如果出現 Cookie database 錯誤，請完全關閉 Chrome 後重試。'
+        }
         $downloadClient = 'Auto'
         $formatSelector = 'bestaudio/best'
         $preserveSource = $qualityMode -eq '保留來源最佳品質'
@@ -1281,7 +1361,20 @@ function Start-Download {
             $args.Add('--print'); $args.Add('before_dl:__YAD_ITEM_START__%(.{id,playlist_index,playlist_count,n_entries,format_id})j')
             Write-Log "[Download] Re-encoding or codec conversion to $format ($qualityLabel)"
         }
-        $args.Add('--print'); $args.Add('after_move:__YAD_ITEM_SUCCESS__%(.{id,playlist_index,playlist_count,n_entries,format_id})j')
+        $args.Add('--plugin-dirs'); $args.Add($MetadataPluginRoot)
+        $args.Add('--embed-metadata')
+        # WAV has no interoperable cover-art convention supported by yt-dlp;
+        # all source-preserving outputs (.opus/.m4a) and other GUI formats do.
+        if ($preserveSource -or $format -ne 'wav') {
+            $args.Add('--embed-thumbnail')
+            $args.Add('--convert-thumbnails'); $args.Add('jpg')
+        }
+        $preserveMetadataValue = if ($preserveSource) { 'true' } else { 'false' }
+        $args.Add('--use-postprocessor'); $args.Add("SourceMetadataPrepare:when=video;client=$downloadClient;preserve=$preserveMetadataValue")
+        $args.Add('--use-postprocessor'); $args.Add("SourceMetadata:when=after_move;client=$downloadClient;preserve=$preserveMetadataValue")
+        # Count an item as successful only after metadata and cover processing
+        # have completed. This remains a per-video event for playlists.
+        $args.Add('--print'); $args.Add('after_video:__YAD_ITEM_SUCCESS__%(.{id,playlist_index,playlist_count,n_entries,format_id})j')
         $args.Add('--progress')
         $args.Add('-o'); $args.Add((Join-Path $destination '%(playlist_index&{} - |)s%(title)s [%(id)s].%(ext)s'))
         if ($playlistCheck.Checked) { $args.Add('--yes-playlist') } else { $args.Add('--no-playlist') }
@@ -1335,6 +1428,7 @@ function Start-Download {
             PreserveSource = $preserveSource
             ProviderSession = $providerSession
             ProviderFailure = $null
+            PlaylistRequested = [bool]$playlistCheck.Checked
             Statistics = $downloadStatistics
             NextHealthCheck = (Get-Date).AddSeconds(5)
             RetryAt = $null
