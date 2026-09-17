@@ -278,6 +278,9 @@ $PoTokenPluginRoot = Join-Path $ToolsRoot 'yt-dlp-plugins'
 $PoTokenPluginZip = Join-Path $PoTokenPluginRoot 'bgutil-ytdlp-pot-provider.zip'
 $MetadataPluginRoot = Join-Path $AppRoot 'plugins'
 $SourceMetadataPlugin = Join-Path $MetadataPluginRoot 'source-metadata\yt_dlp_plugins\postprocessor\source_metadata.py'
+$CookieBridgeExe = Join-Path $ToolsRoot 'cookie-bridge\dist\cookie-bridge.exe'
+$CookieBridgeCookieFile = Join-Path $AppRoot 'data\auth\youtube.cookies.txt'
+$CookieBridgeValidationUrl = 'https://www.youtube.com/watch?v=wWs-sl0zXqw'
 $Script:ActiveProcess = $null
 $Script:DownloadJobHandle = [IntPtr]::Zero
 $Script:SuspendedDownloadPids = @()
@@ -533,35 +536,156 @@ function Ensure-Tools {
     }
 }
 
-function Add-YtDlpAccessArguments([System.Collections.Generic.List[string]]$ArgumentList) {
+function Get-SelectedAuthenticationContext {
+    $mode = switch ($authModeBox.SelectedItem.ToString()) {
+        'Cookie 檔案' { 'CookieFile' }
+        'Chrome Cookie Bridge' { 'CookieBridge' }
+        '瀏覽器直接讀取' { 'Browser' }
+        default { 'None' }
+    }
+    if ($mode -eq 'CookieFile') {
+        $cookieFile = $cookieFileBox.Text.Trim()
+        if ([string]::IsNullOrWhiteSpace($cookieFile)) { throw '請先選擇 cookies.txt。' }
+        if (-not (Test-Path -LiteralPath $cookieFile -PathType Leaf)) { throw "找不到 cookie 檔案：$cookieFile" }
+        return [pscustomobject]@{ Mode = 'CookieFile'; CookiePath = (Resolve-Path -LiteralPath $cookieFile).Path; Browser = ''; CookieCount = 0 }
+    }
+    if ($mode -eq 'Browser') {
+        if ($browserBox.SelectedIndex -lt 0) { throw '請選擇要直接讀取的瀏覽器。' }
+        return [pscustomobject]@{ Mode = 'Browser'; CookiePath = ''; Browser = $browserBox.SelectedItem.ToString().ToLowerInvariant(); CookieCount = 0 }
+    }
+    if ($mode -eq 'CookieBridge') {
+        return [pscustomobject]@{ Mode = 'CookieBridge'; CookiePath = $CookieBridgeCookieFile; Browser = ''; CookieCount = 0 }
+    }
+    return [pscustomobject]@{ Mode = 'None'; CookiePath = ''; Browser = ''; CookieCount = 0 }
+}
+
+function Get-NetscapeCookieCount([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return 0 }
+    $count = 0
+    foreach ($line in [System.IO.File]::ReadLines($Path)) {
+        if (-not [string]::IsNullOrWhiteSpace($line) -and -not $line.StartsWith('#') -and ($line -split "`t").Count -ge 7) { $count++ }
+    }
+    return $count
+}
+
+function Invoke-CookieBridgeExport {
+    # This function deliberately has no GUI dependency so a future scheduled
+    # PlaylistMonitor can call the same export contract.
+    # Fail closed even when the executable itself is missing: a previous
+    # job's cookie file must never be mistaken for a fresh export.
+    if (Test-Path -LiteralPath $CookieBridgeCookieFile) { Remove-Item -LiteralPath $CookieBridgeCookieFile -Force }
+    if (-not (Test-Path -LiteralPath $CookieBridgeExe -PathType Leaf)) {
+        return [pscustomobject]@{ Success = $false; CookiePath = $CookieBridgeCookieFile; CookieCount = 0; Error = "Cookie Bridge 尚未建置：$CookieBridgeExe" }
+    }
+    try {
+        $result = Invoke-CapturedProcess $CookieBridgeExe @('export', '--timeout', '120')
+        if ($result.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $CookieBridgeCookieFile -PathType Leaf)) {
+            # The bridge already removes stale output before export.  Keep the
+            # downloader fail-closed even if an unexpected bridge version does not.
+            if (Test-Path -LiteralPath $CookieBridgeCookieFile) { Remove-Item -LiteralPath $CookieBridgeCookieFile -Force }
+            $detail = @($result.Stderr + $result.Stdout | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Last 1)
+            $message = if ($detail.Count) { [string]$detail[0] } else { "exit code $($result.ExitCode)" }
+            return [pscustomobject]@{ Success = $false; CookiePath = $CookieBridgeCookieFile; CookieCount = 0; Error = $message }
+        }
+        $count = Get-NetscapeCookieCount $CookieBridgeCookieFile
+        if ($count -le 0) {
+            Remove-Item -LiteralPath $CookieBridgeCookieFile -Force
+            return [pscustomobject]@{ Success = $false; CookiePath = $CookieBridgeCookieFile; CookieCount = 0; Error = '匯出檔沒有可用 Cookie。' }
+        }
+        return [pscustomobject]@{ Success = $true; CookiePath = (Resolve-Path -LiteralPath $CookieBridgeCookieFile).Path; CookieCount = $count; Error = '' }
+    } catch {
+        if (Test-Path -LiteralPath $CookieBridgeCookieFile) { Remove-Item -LiteralPath $CookieBridgeCookieFile -Force }
+        return [pscustomobject]@{ Success = $false; CookiePath = $CookieBridgeCookieFile; CookieCount = 0; Error = $_.Exception.Message }
+    }
+}
+
+function Test-CookieBridgeAuthentication([string]$Url, [bool]$RequirePremium) {
+    $arguments = [System.Collections.Generic.List[string]]::new()
+    $arguments.Add('validate'); $arguments.Add('--url'); $arguments.Add($Url)
+    $arguments.Add('--yt-dlp'); $arguments.Add($YtDlp)
+    if ($RequirePremium) { $arguments.Add('--require-premium') }
+    $result = Invoke-CapturedProcess $CookieBridgeExe $arguments.ToArray()
+    $lines = @($result.Stdout + $result.Stderr)
+    return [pscustomobject]@{
+        Success = ($result.ExitCode -eq 0)
+        LoginConfirmed = @($lines | Where-Object { $_ -eq 'Authentication validation successful' }).Count -gt 0
+        PremiumConfirmed = @($lines | Where-Object { $_ -eq 'Premium validation successful' }).Count -gt 0
+        ExitCode = $result.ExitCode
+    }
+}
+
+function Get-CookieBridgeValidationUrl([string]$RequestedUrl) {
+    # A pure playlist URL would make yt-dlp enumerate playlist entries during
+    # auth validation.  Use the requested video when one is present; otherwise
+    # use the small, already verified metadata-only probe target.
+    if ($RequestedUrl -match '(?i)(youtu\.be/|[?&]v=|youtube\.com/(?:shorts|live)/)') { return $RequestedUrl }
+    return $CookieBridgeValidationUrl
+}
+
+function Resolve-AuthenticationContext([string]$ValidationUrl, [bool]$RequirePremium, [bool]$PrepareCookieBridge) {
+    $context = Get-SelectedAuthenticationContext
+    if ($context.Mode -ne 'CookieBridge' -or -not $PrepareCookieBridge) { return $context }
+
+    Write-Log '[Auth] Mode: Chrome Cookie Bridge'
+    Write-Log '[Auth] Requesting current Chrome cookies...'
+    $export = Invoke-CookieBridgeExport
+    if (-not $export.Success) {
+        Write-Log '[Auth] Cookie Bridge export failed'
+        Write-Log '[Auth] Download cancelled'
+        throw "Cookie Bridge 匯出失敗：$($export.Error)"
+    }
+    Write-Log '[Auth] Cookie Bridge export successful'
+    Write-Log "[Auth] Exported cookies: $($export.CookieCount)"
+    try {
+        $validation = Test-CookieBridgeAuthentication (Get-CookieBridgeValidationUrl $ValidationUrl) $RequirePremium
+    } catch {
+        Write-Log '[Auth] Authentication validation failed'
+        Write-Log '[Auth] Download cancelled'
+        throw
+    }
+    if ($validation.LoginConfirmed) { Write-Log '[Auth] YouTube login confirmed' }
+    else {
+        Write-Log '[Auth] YouTube login not confirmed'
+        Write-Log '[Auth] Download cancelled'
+        throw 'Cookie Bridge 匯出成功，但 yt-dlp 未確認 YouTube 登入。'
+    }
+    if ($validation.PremiumConfirmed) { Write-Log '[Auth] Premium confirmed' }
+    elseif ($RequirePremium) {
+        Write-Log '[Auth] Premium not confirmed'
+        Write-Log '[Auth] Download cancelled'
+        throw '目前的保留來源品質模式需要 Premium 驗證，但本次未能確認 Premium。'
+    }
+    if (-not $validation.Success) {
+        Write-Log '[Auth] Authentication validation failed'
+        Write-Log '[Auth] Download cancelled'
+        throw "Cookie Bridge authentication validation failed (exit code $($validation.ExitCode))。"
+    }
+    return [pscustomobject]@{ Mode = 'CookieBridge'; CookiePath = $export.CookiePath; Browser = ''; CookieCount = $export.CookieCount }
+}
+
+function Add-AuthenticationArguments([System.Collections.Generic.List[string]]$ArgumentList, $Authentication) {
+    if ($Authentication.Mode -in @('CookieFile', 'CookieBridge')) {
+        $ArgumentList.Add('--cookies'); $ArgumentList.Add($Authentication.CookiePath)
+    } elseif ($Authentication.Mode -eq 'Browser') {
+        $ArgumentList.Add('--cookies-from-browser'); $ArgumentList.Add($Authentication.Browser)
+    }
+}
+
+function Add-YtDlpAccessArguments([System.Collections.Generic.List[string]]$ArgumentList, $Authentication) {
     $ArgumentList.Add('--ffmpeg-location'); $ArgumentList.Add($ToolsRoot)
     $ArgumentList.Add('--js-runtimes'); $ArgumentList.Add("deno:$Deno")
-    $cookieFile = $cookieFileBox.Text.Trim()
-    if ($cookieFile) {
-        if (-not (Test-Path -LiteralPath $cookieFile -PathType Leaf)) { throw "找不到 cookie 檔案：$cookieFile" }
-        $ArgumentList.Add('--cookies'); $ArgumentList.Add($cookieFile)
-    } elseif ($browserBox.SelectedIndex -gt 0) {
-        $ArgumentList.Add('--cookies-from-browser'); $ArgumentList.Add($browserBox.SelectedItem.ToString().ToLowerInvariant())
-    }
+    Add-AuthenticationArguments $ArgumentList $Authentication
 }
 
 function Get-ProbeCredentialContext {
-    $cookieFile = $cookieFileBox.Text.Trim()
-    if ($cookieFile) {
-        if (-not (Test-Path -LiteralPath $cookieFile -PathType Leaf)) { throw "找不到 cookie 檔案：$cookieFile" }
-        return [pscustomobject]@{ Kind = 'file'; Value = (Resolve-Path -LiteralPath $cookieFile).Path }
-    }
-    if ($browserBox.SelectedIndex -gt 0) {
-        return [pscustomobject]@{ Kind = 'browser'; Value = $browserBox.SelectedItem.ToString().ToLowerInvariant() }
-    }
-    return [pscustomobject]@{ Kind = 'none'; Value = '' }
+    $requirePremium = $qualityModeBox.SelectedItem -eq '保留來源最佳品質'
+    return Resolve-AuthenticationContext $urlBox.Text.Trim() $requirePremium $true
 }
 
-function Add-ProbeAccessArguments([System.Collections.Generic.List[string]]$ArgumentList, $Cookies, [string]$DenoPath) {
+function Add-ProbeAccessArguments([System.Collections.Generic.List[string]]$ArgumentList, $Authentication, [string]$DenoPath) {
     $ArgumentList.Add('--ffmpeg-location'); $ArgumentList.Add($ToolsRoot)
     $ArgumentList.Add('--js-runtimes'); $ArgumentList.Add("deno:$DenoPath")
-    if ($Cookies.Kind -eq 'file') { $ArgumentList.Add('--cookies'); $ArgumentList.Add($Cookies.Value) }
-    elseif ($Cookies.Kind -eq 'browser') { $ArgumentList.Add('--cookies-from-browser'); $ArgumentList.Add($Cookies.Value) }
+    Add-AuthenticationArguments $ArgumentList $Authentication
 }
 
 function Probe-AudioFormats([string]$Url, [string]$Client, $Cookies, [string]$DenoPath) {
@@ -672,7 +796,7 @@ function Compare-ClientAudioFormats([string]$Url, $Cookies, [string]$DenoPath) {
 
 function Get-AudioFormatProbe([string]$Url) {
     $credentials = Get-ProbeCredentialContext
-    $cacheKey = "$Url`n$($credentials.Kind)`n$($credentials.Value)`n$Deno"
+    $cacheKey = "$Url`n$($credentials.Mode)`n$($credentials.CookiePath)`n$($credentials.Browser)`n$Deno"
     if ($Script:FormatProbeCache -and $Script:FormatProbeCache.CacheKey -eq $cacheKey) { return $Script:FormatProbeCache }
     $probe = Compare-ClientAudioFormats $Url $credentials $Deno
     $probe | Add-Member -NotePropertyName CacheKey -NotePropertyValue $cacheKey
@@ -1303,6 +1427,7 @@ function Start-Download {
 
         $format = $formatBox.SelectedItem.ToString().ToLowerInvariant()
         $qualityMode = $qualityModeBox.SelectedItem.ToString()
+        $preserveSource = $qualityMode -eq '保留來源最佳品質'
         $qualityLabel = $qualityBox.SelectedItem.ToString()
         $quality = if ($qualityLabel.StartsWith('0')) { '0' } else { $qualityLabel }
         $destination = $folderBox.Text.Trim()
@@ -1314,11 +1439,12 @@ function Start-Download {
         $args.Add('--no-mtime')
         $args.Add('--ignore-errors')
         $args.Add('--windows-filenames')
-        Add-YtDlpAccessArguments $args
-        $selectedBrowser = $null
-        if (-not $cookieFileBox.Text.Trim() -and $browserBox.SelectedIndex -gt 0) {
-            $selectedBrowser = $browserBox.SelectedItem.ToString().ToLowerInvariant()
-        }
+        # Resolve authentication exactly once per download job.  In Cookie
+        # Bridge mode this performs one fresh export and validation; every
+        # item in the same playlist then reuses the resulting cookie file.
+        $authentication = Resolve-AuthenticationContext $url $preserveSource $true
+        Add-YtDlpAccessArguments $args $authentication
+        $selectedBrowser = if ($authentication.Mode -eq 'Browser') { $authentication.Browser } else { $null }
         if ($selectedBrowser -eq 'chrome' -and @(Get-Process -Name 'chrome' -ErrorAction SilentlyContinue).Count -gt 0) {
             Write-Log '[Auth Warning] 偵測到 Chrome 正在執行。'
             Write-Log '[Auth Warning] yt-dlp 在 Windows 上可能無法複製 Chrome Cookie database。'
@@ -1326,7 +1452,6 @@ function Start-Download {
         }
         $downloadClient = 'Auto'
         $formatSelector = 'bestaudio/best'
-        $preserveSource = $qualityMode -eq '保留來源最佳品質'
         if ($preserveSource) {
             $providerSession = Ensure-PoTokenProvider
             if (-not (Test-PoTokenProviderPing $providerSession.BaseUrl)) {
@@ -1381,13 +1506,15 @@ function Start-Download {
         $args.Add($url)
 
         Write-Log "開始下載：格式 $format，模式 $qualityMode，輸出至 $destination"
-        $cookieFile = $cookieFileBox.Text.Trim()
-        if ($cookieFile) {
+        if ($authentication.Mode -eq 'CookieFile') {
             Write-Log '[Auth] Download mode: cookies file'
-            Write-Log "[Auth] Cookie path: $cookieFile"
+            Write-Log "[Auth] Cookie path: $($authentication.CookiePath)"
             $authSummary = 'cookies file'
-        } elseif ($browserBox.SelectedIndex -gt 0) {
-            $browserName = $browserBox.SelectedItem.ToString().ToLowerInvariant()
+        } elseif ($authentication.Mode -eq 'CookieBridge') {
+            Write-Log '[Auth] Download mode: Chrome Cookie Bridge'
+            $authSummary = 'cookie bridge'
+        } elseif ($authentication.Mode -eq 'Browser') {
+            $browserName = $authentication.Browser
             Write-Log '[Auth] Download mode: browser'
             Write-Log "[Auth] Browser: $browserName"
             $authSummary = "browser:$browserName"
@@ -1427,6 +1554,7 @@ function Start-Download {
             LoggedProcess = $loggedProcess
             PreserveSource = $preserveSource
             ProviderSession = $providerSession
+            Authentication = $authentication
             ProviderFailure = $null
             PlaylistRequested = [bool]$playlistCheck.Checked
             Statistics = $downloadStatistics
@@ -1497,17 +1625,29 @@ function Update-QualityControls {
 }
 $qualityModeBox.Add_SelectedIndexChanged({ Update-QualityControls })
 Update-QualityControls
-Add-Label '登入瀏覽器' 5
-$browserBox = [System.Windows.Forms.ComboBox]@{ DropDownStyle='DropDownList'; Width=170 }; [void]$browserBox.Items.AddRange(@('不使用登入','Chrome','Edge','Firefox','Brave')); $browserBox.SelectedIndex=0; $panel.Controls.Add($browserBox,1,5)
+Add-Label '登入方式' 5
+$authLine = [System.Windows.Forms.FlowLayoutPanel]@{ Dock='Fill'; AutoSize=$true; WrapContents=$false }
+$authModeBox = [System.Windows.Forms.ComboBox]@{ DropDownStyle='DropDownList'; Width=190 }; [void]$authModeBox.Items.AddRange(@('不使用登入','Cookie 檔案','Chrome Cookie Bridge','瀏覽器直接讀取')); $authModeBox.SelectedIndex=0
+$browserBox = [System.Windows.Forms.ComboBox]@{ DropDownStyle='DropDownList'; Width=120 }; [void]$browserBox.Items.AddRange(@('Chrome','Edge','Firefox','Brave')); $browserBox.SelectedIndex=0
+$authLine.Controls.AddRange(@($authModeBox,$browserBox)); $panel.Controls.Add($authLine,1,5)
 Add-Label 'Cookies 檔案' 6
 $cookieLine = [System.Windows.Forms.FlowLayoutPanel]@{ Dock='Fill'; AutoSize=$true; WrapContents=$false }
 $cookieFileBox = [System.Windows.Forms.TextBox]@{ Width=520 }
 $cookieBrowseButton = [System.Windows.Forms.Button]@{ Text='選擇…'; AutoSize=$true }
-$cookieBrowseButton.Add_Click({ $d=[System.Windows.Forms.OpenFileDialog]::new(); $d.Filter='Cookie files (*.txt)|*.txt|All files (*.*)|*.*'; $d.Title='選擇 Netscape cookies.txt'; if($d.ShowDialog() -eq 'OK'){$cookieFileBox.Text=$d.FileName} })
+$cookieBrowseButton.Add_Click({ $d=[System.Windows.Forms.OpenFileDialog]::new(); $d.Filter='Cookie files (*.txt)|*.txt|All files (*.*)|*.*'; $d.Title='選擇 Netscape cookies.txt'; if($d.ShowDialog() -eq 'OK'){$cookieFileBox.Text=$d.FileName; $authModeBox.SelectedItem='Cookie 檔案'} })
 $cookieLine.Controls.AddRange(@($cookieFileBox,$cookieBrowseButton)); $panel.Controls.Add($cookieLine,1,6)
+function Update-AuthenticationControls {
+    $cookieMode = $authModeBox.SelectedItem -eq 'Cookie 檔案'
+    $browserMode = $authModeBox.SelectedItem -eq '瀏覽器直接讀取'
+    $cookieFileBox.Enabled = $cookieMode
+    $cookieBrowseButton.Enabled = $cookieMode
+    $browserBox.Enabled = $browserMode
+}
 $urlBox.Add_TextChanged({ $Script:FormatProbeCache = $null })
 $cookieFileBox.Add_TextChanged({ $Script:FormatProbeCache = $null })
 $browserBox.Add_SelectedIndexChanged({ $Script:FormatProbeCache = $null })
+$authModeBox.Add_SelectedIndexChanged({ $Script:FormatProbeCache = $null; Update-AuthenticationControls })
+Update-AuthenticationControls
 Add-Label '輸出資料夾' 7
 $folderLine = [System.Windows.Forms.FlowLayoutPanel]@{ Dock='Fill'; AutoSize=$true; WrapContents=$false }
 $folderBox = [System.Windows.Forms.TextBox]@{ Width=520; Text=$OutputRoot }; $browseButton = [System.Windows.Forms.Button]@{ Text='選擇…'; AutoSize=$true }

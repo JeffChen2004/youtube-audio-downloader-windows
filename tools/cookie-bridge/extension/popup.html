@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>YouTube Cookie Bridge</title>
+  <style>
+    body { font: 14px system-ui, sans-serif; width: 280px; margin: 16px; color: #202124; }
+    button { width: 100%; padding: 9px; cursor: pointer; }
+    #status { margin-top: 12px; line-height: 1.4; overflow-wrap: anywhere; }
+    .note { color: #5f6368; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <strong>YouTube Cookie Bridge</strong>
+  <p class="note">只傳送 YouTube／Google 登入 Cookie 到已註冊的本機 Native Messaging host；不顯示 Cookie 值。</p>
+  <button id="export" type="button">立即檢查匯出請求</button>
+  <div id="status" role="status">就緒</div>
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -1,5 +1,5 @@
 # Local dependencies and downloaded media
-/tools/
+/tools/*
 /downloads/
 *.opus
 *.webm
@@ -11,6 +11,7 @@
 *.ytdl
 
 # Authentication files: never commit browser sessions
+/data/auth/
 *cookie*
 *Cookie*
 *.txt
@@ -19,3 +20,8 @@
 *.log
 *.tmp
 *.zip
+
+# Keep the Cookie Bridge source, but never its compiled output or credentials.
+!/tools/cookie-bridge/
+!/tools/cookie-bridge/**
+/tools/cookie-bridge/dist/

@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "YouTube Cookie Bridge",
+  "version": "0.1.0",
+  "description": "Exports only YouTube and Google account cookies to a local native host.",
+  "minimum_chrome_version": "120",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1o4uHA4yWqZ9WwjjfsEg2QvYjv7VAwGM4JiqcrFhmwydqILrrSH/Fjlpge2ILlNx/cnUl2CQBQP7EJlwi/mURWTvdZVyg9OAalVWcGBacxeJm+lihf5+mWkuAtSaiP4Q03cycrsa/IqaOhWPv+Q+NsKlXDo6da/un5TOx/TWX9Ok9WrdBmn6P9SWzqIxCYLWuR7grSVlpAF1BaSDqb5URb+WzbXEi7N+1pGjp+b6eYNgq4NDUSPtIjU38DUNcn8LKCwmw1z9EniGdjthL4t+rmDLE42vjBLUJX8L+ukSho1LMjzTi0XUm5qYGJZ15HOOkw+zEuquOz8GdrKCwsyzewIDAQAB",
+  "permissions": [
+    "alarms",
+    "cookies",
+    "nativeMessaging"
+  ],
+  "host_permissions": [
+    "https://*.youtube.com/*",
+    "https://*.google.com/*"
+  ],
+  "background": {
+    "service_worker": "service_worker.js"
+  },
+  "action": {
+    "default_title": "YouTube Cookie Bridge",
+    "default_popup": "popup.html"
+  }
+}
