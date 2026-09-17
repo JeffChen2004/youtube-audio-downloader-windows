@@ -281,6 +281,10 @@ $SourceMetadataPlugin = Join-Path $MetadataPluginRoot 'source-metadata\yt_dlp_pl
 $CookieBridgeExe = Join-Path $ToolsRoot 'cookie-bridge\dist\cookie-bridge.exe'
 $CookieBridgeCookieFile = Join-Path $AppRoot 'data\auth\youtube.cookies.txt'
 $CookieBridgeValidationUrl = 'https://www.youtube.com/watch?v=wWs-sl0zXqw'
+$PlaylistTrackerScript = Join-Path $AppRoot 'PlaylistTracker.ps1'
+if (-not (Test-Path -LiteralPath $PlaylistTrackerScript -PathType Leaf)) { throw "找不到播放清單追蹤模組：$PlaylistTrackerScript" }
+. $PlaylistTrackerScript
+Initialize-PlaylistTrackerStorage $AppRoot
 $Script:ActiveProcess = $null
 $Script:DownloadJobHandle = [IntPtr]::Zero
 $Script:SuspendedDownloadPids = @()
@@ -290,6 +294,8 @@ $Script:DownloadContext = $null
 $Script:DownloadTimerBusy = $false
 $Script:LastPoTokenSetupLines = @()
 $Script:PoTokenProviderProcess = $null
+$Script:TrackedPlaylistQueue = [System.Collections.Generic.Queue[object]]::new()
+$Script:TrackerBatchActive = $false
 
 function Write-Log([string]$Message) {
     $log.AppendText("[$(Get-Date -Format 'HH:mm:ss')] $Message`r`n")
@@ -622,8 +628,7 @@ function Get-CookieBridgeValidationUrl([string]$RequestedUrl) {
     return $CookieBridgeValidationUrl
 }
 
-function Resolve-AuthenticationContext([string]$ValidationUrl, [bool]$RequirePremium, [bool]$PrepareCookieBridge) {
-    $context = Get-SelectedAuthenticationContext
+function Resolve-AuthenticationContextValue($context, [string]$ValidationUrl, [bool]$RequirePremium, [bool]$PrepareCookieBridge) {
     if ($context.Mode -ne 'CookieBridge' -or -not $PrepareCookieBridge) { return $context }
 
     Write-Log '[Auth] Mode: Chrome Cookie Bridge'
@@ -661,6 +666,31 @@ function Resolve-AuthenticationContext([string]$ValidationUrl, [bool]$RequirePre
         throw "Cookie Bridge authentication validation failed (exit code $($validation.ExitCode))。"
     }
     return [pscustomobject]@{ Mode = 'CookieBridge'; CookiePath = $export.CookiePath; Browser = ''; CookieCount = $export.CookieCount }
+}
+
+function Resolve-AuthenticationContext([string]$ValidationUrl, [bool]$RequirePremium, [bool]$PrepareCookieBridge) {
+    return Resolve-AuthenticationContextValue (Get-SelectedAuthenticationContext) $ValidationUrl $RequirePremium $PrepareCookieBridge
+}
+
+function Get-TrackedPlaylistAuthenticationContext($Configuration) {
+    $mode = [string]$Configuration.auth_mode
+    if ($mode -notin @('None', 'CookieFile', 'CookieBridge', 'Browser')) { throw "不支援的追蹤認證模式：$mode" }
+    if ($mode -eq 'CookieFile') {
+        $path = [string]$Configuration.cookie_file_path
+        if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "追蹤播放清單的 Cookie 檔案不存在：$path"
+        }
+        return [pscustomobject]@{ Mode = $mode; CookiePath = (Resolve-Path -LiteralPath $path).Path; Browser = ''; CookieCount = 0 }
+    }
+    if ($mode -eq 'CookieBridge') {
+        return [pscustomobject]@{ Mode = $mode; CookiePath = $CookieBridgeCookieFile; Browser = ''; CookieCount = 0 }
+    }
+    if ($mode -eq 'Browser') {
+        $browser = [string]$Configuration.browser
+        if ([string]::IsNullOrWhiteSpace($browser)) { throw '追蹤播放清單未記錄 browser。' }
+        return [pscustomobject]@{ Mode = $mode; CookiePath = ''; Browser = $browser.ToLowerInvariant(); CookieCount = 0 }
+    }
+    return [pscustomobject]@{ Mode = 'None'; CookiePath = ''; Browser = ''; CookieCount = 0 }
 }
 
 function Add-AuthenticationArguments([System.Collections.Generic.List[string]]$ArgumentList, $Authentication) {
@@ -936,6 +966,199 @@ function Check-Formats {
     } finally { $probeButton.Enabled = $true }
 }
 
+function Get-TrackedPlaylistSnapshot {
+    param(
+        [string]$Url,
+        $Authentication,
+        [string]$InitializeArchivePath = ''
+    )
+    $arguments = [System.Collections.Generic.List[string]]::new()
+    $arguments.Add('--flat-playlist')
+    $arguments.Add('--skip-download')
+    $arguments.Add('--dump-single-json')
+    Add-YtDlpAccessArguments $arguments $Authentication
+
+    $temporaryArchive = ''
+    if (-not [string]::IsNullOrWhiteSpace($InitializeArchivePath)) {
+        $archiveDirectory = Split-Path -Parent $InitializeArchivePath
+        New-Item -ItemType Directory -Force -Path $archiveDirectory | Out-Null
+        $temporaryArchive = Join-Path $archiveDirectory (([System.IO.Path]::GetFileName($InitializeArchivePath)) + '.' + [guid]::NewGuid().ToString('N') + '.tmp')
+        # --force-write-archive asks yt-dlp itself to generate its canonical
+        # extractor/id archive keys even though this is a metadata-only run.
+        $arguments.Add('--force-write-archive')
+        $arguments.Add('--download-archive'); $arguments.Add($temporaryArchive)
+    }
+    $arguments.Add($Url)
+
+    try {
+        $result = Invoke-CapturedProcess $YtDlp $arguments.ToArray()
+        if ($result.ExitCode -ne 0) {
+            $detail = @($result.Stderr + $result.Stdout | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Last 1)
+            $message = if ($detail.Count) { [string]$detail[0] } else { "yt-dlp exit code $($result.ExitCode)" }
+            throw "無法取得播放清單：$message"
+        }
+        $jsonText = ($result.Stdout -join "`n").Trim()
+        if ([string]::IsNullOrWhiteSpace($jsonText)) { throw 'yt-dlp 沒有回傳播放清單 JSON。' }
+        $playlist = $jsonText | ConvertFrom-Json
+        if ([string]::IsNullOrWhiteSpace([string]$playlist.id)) { throw 'yt-dlp JSON 沒有 playlist ID。' }
+        $entries = @($playlist.entries | Where-Object { $_ -and -not [string]::IsNullOrWhiteSpace([string]$_.id) })
+
+        if ($temporaryArchive) {
+            if (-not (Test-Path -LiteralPath $temporaryArchive -PathType Leaf)) {
+                # An empty playlist legitimately produces no archive entries.
+                [System.IO.File]::WriteAllText($temporaryArchive, '', [System.Text.UTF8Encoding]::new($false))
+            }
+            Move-Item -LiteralPath $temporaryArchive -Destination $InitializeArchivePath -Force
+            $temporaryArchive = ''
+        }
+        return [pscustomobject]@{
+            PlaylistId = [string]$playlist.id
+            PlaylistTitle = if ([string]::IsNullOrWhiteSpace([string]$playlist.title)) { [string]$playlist.id } else { [string]$playlist.title }
+            ItemCount = $entries.Count
+            VideoIds = @($entries | ForEach-Object { [string]$_.id })
+        }
+    } finally {
+        if ($temporaryArchive -and (Test-Path -LiteralPath $temporaryArchive)) { Remove-Item -LiteralPath $temporaryArchive -Force }
+    }
+}
+
+function Show-TrackerAddModeDialog {
+    $dialog = [System.Windows.Forms.Form]@{ Text='加入追蹤播放清單'; Size=[System.Drawing.Size]::new(510,230); StartPosition='CenterParent'; FormBorderStyle='FixedDialog'; MaximizeBox=$false; MinimizeBox=$false; ShowInTaskbar=$false }
+    $description = [System.Windows.Forms.Label]@{ Text='選擇初始追蹤方式：'; AutoSize=$true; Location=[System.Drawing.Point]::new(20,18) }
+    $fromNow = [System.Windows.Forms.RadioButton]@{ Text='從現在開始追蹤（目前項目只標記為已知，不下載）'; AutoSize=$true; Checked=$true; Location=[System.Drawing.Point]::new(24,52) }
+    $backfill = [System.Windows.Forms.RadioButton]@{ Text='補齊目前播放清單（下載 archive 中尚未記錄的項目）'; AutoSize=$true; Location=[System.Drawing.Point]::new(24,86) }
+    $ok = [System.Windows.Forms.Button]@{ Text='加入'; DialogResult=[System.Windows.Forms.DialogResult]::OK; Location=[System.Drawing.Point]::new(310,135); Size=[System.Drawing.Size]::new(78,30) }
+    $cancel = [System.Windows.Forms.Button]@{ Text='取消'; DialogResult=[System.Windows.Forms.DialogResult]::Cancel; Location=[System.Drawing.Point]::new(397,135); Size=[System.Drawing.Size]::new(78,30) }
+    $dialog.Controls.AddRange(@($description,$fromNow,$backfill,$ok,$cancel)); $dialog.AcceptButton=$ok; $dialog.CancelButton=$cancel
+    try {
+        if ($dialog.ShowDialog($form) -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
+        return $(if ($fromNow.Checked) { 'FromNow' } else { 'Backfill' })
+    } finally { $dialog.Dispose() }
+}
+
+function Add-TrackedPlaylist {
+    if ($Script:DownloadState -ne 'Idle') {
+        [System.Windows.Forms.MessageBox]::Show('請先等待目前下載工作結束。', '播放清單追蹤', 'OK', 'Information') | Out-Null
+        return
+    }
+    $url = $urlBox.Text.Trim()
+    if ([string]::IsNullOrWhiteSpace($url)) {
+        [System.Windows.Forms.MessageBox]::Show('請先輸入 YouTube 播放清單網址。', '播放清單追蹤', 'OK', 'Warning') | Out-Null
+        return
+    }
+    $mode = Show-TrackerAddModeDialog
+    if (-not $mode) { return }
+    try {
+        $trackAddButton.Enabled = $false
+        Ensure-Tools
+        $preserveSource = $qualityModeBox.SelectedItem.ToString() -eq '保留來源最佳品質'
+        $authentication = Resolve-AuthenticationContextValue (Get-SelectedAuthenticationContext) $url $preserveSource $true
+        # First obtain the canonical playlist id/title.  FromNow then repeats
+        # the lightweight listing with --force-write-archive so yt-dlp, not
+        # this script, creates every archive entry.
+        $snapshot = Get-TrackedPlaylistSnapshot $url $authentication
+        $paths = Get-TrackedPlaylistStatePaths $snapshot.PlaylistId
+        if ((Test-Path -LiteralPath $paths.ConfigPath) -or (Test-Path -LiteralPath $paths.ArchivePath)) {
+            $choice = [System.Windows.Forms.MessageBox]::Show("播放清單 $($snapshot.PlaylistId) 已在追蹤清單中。要取代現有設定與初始狀態嗎？", '確認取代', 'YesNo', 'Warning')
+            if ($choice -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+        }
+        if ($mode -eq 'FromNow') {
+            Write-Log "[Tracker] 正在初始化 archive；目前 $($snapshot.ItemCount) 個項目不會下載。"
+            $initialPlaylistId = $snapshot.PlaylistId
+            $snapshot = Get-TrackedPlaylistSnapshot $url $authentication $paths.ArchivePath
+            if ($snapshot.PlaylistId -ne $initialPlaylistId) {
+                if (Test-Path -LiteralPath $paths.ArchivePath) { Remove-Item -LiteralPath $paths.ArchivePath -Force }
+                throw '初始化期間播放清單 ID 發生變化；已取消保存追蹤設定。'
+            }
+        } else {
+            if (Test-Path -LiteralPath $paths.ArchivePath) { Remove-Item -LiteralPath $paths.ArchivePath -Force }
+        }
+        $destination = $folderBox.Text.Trim()
+        if ([string]::IsNullOrWhiteSpace($destination)) { $destination = $OutputRoot }
+        $configuration = New-TrackedPlaylistConfiguration -PlaylistId $snapshot.PlaylistId -PlaylistUrl $url -PlaylistTitle $snapshot.PlaylistTitle -OutputFolder $destination -Authentication $authentication -QualityMode $qualityModeBox.SelectedItem.ToString() -AudioFormat $formatBox.SelectedItem.ToString().ToLowerInvariant() -TranscodeQuality $qualityBox.SelectedItem.ToString()
+        Save-TrackedPlaylistConfiguration $configuration $paths.ConfigPath
+        Write-Log "[Tracker] 已加入：$($snapshot.PlaylistTitle)"
+        Write-Log "[Tracker] Playlist ID: $($snapshot.PlaylistId)"
+        Write-Log "[Tracker] Archive: $($paths.ArchivePath)"
+        if ($mode -eq 'FromNow') {
+            Write-Log "[Tracker] 已將目前 $($snapshot.ItemCount) 個項目標記為已知；下載 0 首。"
+        } else {
+            Write-Log '[Tracker] 即將補齊目前播放清單。'
+            Start-TrackedPlaylistBatch @($paths.ConfigPath)
+        }
+    } catch {
+        Write-Log '[Tracker] Check failed before playlist processing'
+        Write-Log "[Tracker] Reason: $($_.Exception.Message)"
+        [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '加入追蹤失敗', 'OK', 'Error') | Out-Null
+    } finally { $trackAddButton.Enabled = $true }
+}
+
+function Show-TrackedPlaylistList {
+    $dialog = [System.Windows.Forms.Form]@{ Text='追蹤播放清單'; Size=[System.Drawing.Size]::new(760,390); StartPosition='CenterParent'; ShowInTaskbar=$false }
+    $grid = [System.Windows.Forms.DataGridView]@{ Dock='Fill'; ReadOnly=$true; AllowUserToAddRows=$false; AllowUserToDeleteRows=$false; AutoSizeColumnsMode='Fill'; RowHeadersVisible=$false; SelectionMode='FullRowSelect' }
+    [void]$grid.Columns.Add('Enabled','啟用'); [void]$grid.Columns.Add('Title','播放清單'); [void]$grid.Columns.Add('Auth','登入'); [void]$grid.Columns.Add('LastChecked','上次檢查'); [void]$grid.Columns.Add('Output','輸出資料夾')
+    foreach ($item in @(Get-TrackedPlaylistConfigurations)) {
+        if ($item.Configuration) {
+            $c=$item.Configuration; [void]$grid.Rows.Add([string]$c.enabled,[string]$c.playlist_title,[string]$c.auth_mode,[string]$c.last_checked_at,[string]$c.output_folder)
+        } else { [void]$grid.Rows.Add('錯誤',[System.IO.Path]::GetFileName($item.Path),'', $item.Error,'') }
+    }
+    $dialog.Controls.Add($grid)
+    try { [void]$dialog.ShowDialog($form) } finally { $dialog.Dispose() }
+}
+
+function Start-TrackedPlaylistBatch([string[]]$ConfigPaths = @()) {
+    if ($Script:DownloadState -ne 'Idle') {
+        [System.Windows.Forms.MessageBox]::Show('已有下載工作進行中。', '播放清單追蹤', 'OK', 'Information') | Out-Null
+        return
+    }
+    if (-not $ConfigPaths -or $ConfigPaths.Count -eq 0) {
+        $ConfigPaths = @(Get-TrackedPlaylistConfigurations | Where-Object { $_.Configuration -and [bool]$_.Configuration.enabled } | ForEach-Object { $_.Path })
+    }
+    if ($ConfigPaths.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show('目前沒有已啟用的追蹤播放清單。', '播放清單追蹤', 'OK', 'Information') | Out-Null
+        return
+    }
+    $Script:TrackedPlaylistQueue.Clear()
+    foreach ($path in $ConfigPaths) { $Script:TrackedPlaylistQueue.Enqueue($path) }
+    $Script:TrackerBatchActive = $true
+    $trackCheckButton.Enabled = $false
+    Start-NextTrackedPlaylistCheck
+}
+
+function Start-NextTrackedPlaylistCheck {
+    if (-not $Script:TrackerBatchActive) { return }
+    if ($Script:TrackedPlaylistQueue.Count -eq 0) {
+        $Script:TrackerBatchActive = $false
+        $trackCheckButton.Enabled = $true
+        Write-Log '[Tracker] 所有已啟用的追蹤播放清單檢查完成。'
+        return
+    }
+    $path = [string]$Script:TrackedPlaylistQueue.Dequeue()
+    Invoke-TrackedPlaylistCheck $path
+}
+
+function Invoke-TrackedPlaylistCheck([string]$ConfigPath) {
+    try {
+        $configuration = Read-TrackedPlaylistConfiguration $ConfigPath
+        if (-not [bool]$configuration.enabled) {
+            Write-Log "[Tracker] 已停用，跳過：$($configuration.playlist_title)"
+            Start-NextTrackedPlaylistCheck
+            return
+        }
+        $paths = Get-TrackedPlaylistStatePaths ([string]$configuration.playlist_id)
+        Write-Log "[Tracker] Checking: $($configuration.playlist_title)"
+        Write-Log "[Tracker] Playlist ID: $($configuration.playlist_id)"
+        Write-Log "[Tracker] Auth: $($configuration.auth_mode)"
+        Write-Log "[Tracker] Archive: $($paths.ArchivePath)"
+        Start-Download -TrackerConfiguration $configuration -TrackerConfigPath $ConfigPath -TrackerArchivePath $paths.ArchivePath
+    } catch {
+        Write-Log '[Tracker] Check failed before playlist processing'
+        Write-Log "[Tracker] Reason: $($_.Exception.Message)"
+        try { Update-TrackedPlaylistTimestamps $ConfigPath $false } catch { Write-Log "[Tracker] 無法更新檢查時間：$($_.Exception.Message)" }
+        Start-NextTrackedPlaylistCheck
+    }
+}
+
 function New-DownloadStatistics {
     return [pscustomobject]@{
         ExpectedTotal = 0
@@ -950,6 +1173,8 @@ function New-DownloadStatistics {
         JobFailureReason = $null
         BrowserCookieErrorReported = $false
         AuthenticationFailureStopRequested = $false
+        IsTracker = $false
+        TrackerNewIds = [System.Collections.Generic.HashSet[string]]::new()
     }
 }
 
@@ -959,8 +1184,8 @@ function Test-BrowserCookieDatabaseLocked([string]$Line) {
 }
 
 function Get-DownloadItemKey($Item) {
-    if ($Item.playlist_index -and $Item.playlist_index -ne 'NA') { return "playlist:$($Item.playlist_index)" }
     if ($Item.id -and $Item.id -ne 'NA') { return "video:$($Item.id)" }
+    if ($Item.playlist_index -and $Item.playlist_index -ne 'NA') { return "playlist:$($Item.playlist_index)" }
     return 'video:1'
 }
 
@@ -988,6 +1213,9 @@ function Write-PreferredFormatSelectionLog([string]$Line, $Statistics = $null) {
             [void]$Statistics.Items.Add($key)
             $Statistics.CurrentKey = $key
             $Statistics.SelectedByItem[$key] = $selectedId
+            if ($Statistics.IsTracker -and $item.id -and $Statistics.TrackerNewIds.Add([string]$item.id)) {
+                Write-Log "[Tracker] New item detected: $($item.id)"
+            }
             $reportedTotal = if ($item.playlist_count -and $item.playlist_count -ne 'NA') { [int]$item.playlist_count } elseif ($item.n_entries -and $item.n_entries -ne 'NA') { [int]$item.n_entries } else { 1 }
             if ($reportedTotal -gt $Statistics.ExpectedTotal) { $Statistics.ExpectedTotal = $reportedTotal }
         }
@@ -1030,6 +1258,9 @@ function Write-DownloadProcessLine([string]$Line, [bool]$PreserveSource, $Statis
             [void]$Statistics.Items.Add($key)
             $Statistics.CurrentKey = $key
             $Statistics.SelectedByItem[$key] = [string]$item.format_id
+            if ($Statistics.IsTracker -and $item.id -and $Statistics.TrackerNewIds.Add([string]$item.id)) {
+                Write-Log "[Tracker] New item detected: $($item.id)"
+            }
             $reportedTotal = if ($item.playlist_count -and $item.playlist_count -ne 'NA') { [int]$item.playlist_count } elseif ($item.n_entries -and $item.n_entries -ne 'NA') { [int]$item.n_entries } else { 1 }
             if ($reportedTotal -gt $Statistics.ExpectedTotal) { $Statistics.ExpectedTotal = $reportedTotal }
         } catch { Write-Log "[Summary] 無法解析項目開始紀錄：$($_.Exception.Message)" }
@@ -1107,6 +1338,37 @@ function Write-DownloadSummary($Statistics, [bool]$Stopped, [bool]$ProcessFailed
     Write-Log "跳過：$($Statistics.Skipped.Count)"
     if ($Stopped) { Write-Log "未處理：$unprocessed" }
     Write-Log "PO Token Retry：$($Statistics.PoTokenRetryCount)"
+    Write-Log '=============================='
+}
+
+function Write-TrackedPlaylistSummary($Configuration, $Statistics, [bool]$Stopped, [bool]$ProcessFailed) {
+    if ($Statistics.Items.Count -eq 0 -and $ProcessFailed) {
+        Write-Log '[Tracker] Check failed before playlist processing'
+        if ($Statistics.JobFailureReason) { Write-Log "[Tracker] Reason: $($Statistics.JobFailureReason)" }
+        return
+    }
+    if (-not $Stopped -and -not $ProcessFailed -and $Statistics.Success.Count -eq 0 -and $Statistics.Failed.Count -eq 0) {
+        Write-Log '[Tracker] No new videos found.'
+    } else {
+        Write-Log "[Tracker] New downloaded: $($Statistics.Success.Count)"
+    }
+    $counts = @{ '774'=0; '141'=0; '251'=0 }
+    foreach ($key in $Statistics.Success) {
+        if ($Statistics.SelectedByItem.ContainsKey($key)) {
+            $selected = [string]$Statistics.SelectedByItem[$key]
+            if ($counts.ContainsKey($selected)) { $counts[$selected]++ }
+        }
+    }
+    Write-Log '=============================='
+    Write-Log '播放清單追蹤摘要'
+    Write-Log '=============================='
+    Write-Log "播放清單：$($Configuration.playlist_title)"
+    Write-Log "原有/已跳過：$($Statistics.Skipped.Count)"
+    Write-Log "新下載：$($Statistics.Success.Count)"
+    Write-Log "失敗：$($Statistics.Failed.Count)"
+    Write-Log "774：$($counts['774'])"
+    Write-Log "141：$($counts['141'])"
+    Write-Log "251：$($counts['251'])"
     Write-Log '=============================='
 }
 
@@ -1352,6 +1614,7 @@ function Complete-DownloadSession($Context) {
         [bool]$Context.Statistics.JobFailureCategory -or
         $Script:ActiveProcess.ExitCode -ne 0
     )
+    $trackerSuccessful = $false
     try {
         if ($Context.ProviderFailure) {
             Write-Log "錯誤：$($Context.ProviderFailure)"
@@ -1367,6 +1630,12 @@ function Complete-DownloadSession($Context) {
         Close-DownloadJob
         if ($Context.ProviderSession) { Stop-PoTokenProvider }
         Write-DownloadSummary $Context.Statistics $Script:DownloadCancelled $processFailed $Context.PlaylistRequested
+        if ($Context.TrackerConfiguration) {
+            $trackerSuccessful = (-not $processFailed -and -not $Script:DownloadCancelled -and $Context.Statistics.Failed.Count -eq 0)
+            Write-TrackedPlaylistSummary $Context.TrackerConfiguration $Context.Statistics $Script:DownloadCancelled $processFailed
+            try { Update-TrackedPlaylistTimestamps $Context.TrackerConfigPath $trackerSuccessful }
+            catch { Write-Log "[Tracker] 無法更新檢查時間：$($_.Exception.Message)" }
+        }
         $Script:ActiveProcess = $null
         $Script:SuspendedDownloadPids = @()
         $Script:DownloadContext = $null
@@ -1374,6 +1643,14 @@ function Complete-DownloadSession($Context) {
         $startButton.Enabled = $true
         $cancelButton.Enabled = $false
         $cancelButton.Text = '停止'
+        if ($Context.TrackerConfiguration) {
+            if ($Script:DownloadCancelled) {
+                $Script:TrackedPlaylistQueue.Clear()
+                $Script:TrackerBatchActive = $false
+                $trackCheckButton.Enabled = $true
+                Write-Log '[Tracker] 使用者已終止本次追蹤批次。'
+            } else { Start-NextTrackedPlaylistCheck }
+        }
     }
 }
 
@@ -1407,7 +1684,12 @@ function Update-DownloadSession {
 }
 
 function Start-Download {
-    $url = $urlBox.Text.Trim()
+    param(
+        $TrackerConfiguration = $null,
+        [string]$TrackerConfigPath = '',
+        [string]$TrackerArchivePath = ''
+    )
+    $url = if ($TrackerConfiguration) { [string]$TrackerConfiguration.playlist_url } else { $urlBox.Text.Trim() }
     if ([string]::IsNullOrWhiteSpace($url)) {
         [System.Windows.Forms.MessageBox]::Show('請貼上影片或播放清單網址。', '缺少網址', 'OK', 'Warning') | Out-Null
         return
@@ -1419,18 +1701,19 @@ function Start-Download {
 
     $providerSession = $null
     $downloadStatistics = New-DownloadStatistics
+    $downloadStatistics.IsTracker = [bool]$TrackerConfiguration
     $Script:DownloadCancelled = $false
     try {
         $startButton.Enabled = $false
         $cancelButton.Enabled = $true
         Ensure-Tools
 
-        $format = $formatBox.SelectedItem.ToString().ToLowerInvariant()
-        $qualityMode = $qualityModeBox.SelectedItem.ToString()
+        $format = if ($TrackerConfiguration -and $TrackerConfiguration.audio_format) { [string]$TrackerConfiguration.audio_format } else { $formatBox.SelectedItem.ToString().ToLowerInvariant() }
+        $qualityMode = if ($TrackerConfiguration -and $TrackerConfiguration.quality_mode) { [string]$TrackerConfiguration.quality_mode } else { $qualityModeBox.SelectedItem.ToString() }
         $preserveSource = $qualityMode -eq '保留來源最佳品質'
-        $qualityLabel = $qualityBox.SelectedItem.ToString()
+        $qualityLabel = if ($TrackerConfiguration -and $TrackerConfiguration.transcode_quality) { [string]$TrackerConfiguration.transcode_quality } else { $qualityBox.SelectedItem.ToString() }
         $quality = if ($qualityLabel.StartsWith('0')) { '0' } else { $qualityLabel }
-        $destination = $folderBox.Text.Trim()
+        $destination = if ($TrackerConfiguration) { [string]$TrackerConfiguration.output_folder } else { $folderBox.Text.Trim() }
         if ([string]::IsNullOrWhiteSpace($destination)) { $destination = $OutputRoot }
         New-Item -ItemType Directory -Force -Path $destination | Out-Null
 
@@ -1442,7 +1725,8 @@ function Start-Download {
         # Resolve authentication exactly once per download job.  In Cookie
         # Bridge mode this performs one fresh export and validation; every
         # item in the same playlist then reuses the resulting cookie file.
-        $authentication = Resolve-AuthenticationContext $url $preserveSource $true
+        $selectedAuthentication = if ($TrackerConfiguration) { Get-TrackedPlaylistAuthenticationContext $TrackerConfiguration } else { Get-SelectedAuthenticationContext }
+        $authentication = Resolve-AuthenticationContextValue $selectedAuthentication $url $preserveSource $true
         Add-YtDlpAccessArguments $args $authentication
         $selectedBrowser = if ($authentication.Mode -eq 'Browser') { $authentication.Browser } else { $null }
         if ($selectedBrowser -eq 'chrome' -and @(Get-Process -Name 'chrome' -ErrorAction SilentlyContinue).Count -gt 0) {
@@ -1502,7 +1786,13 @@ function Start-Download {
         $args.Add('--print'); $args.Add('after_video:__YAD_ITEM_SUCCESS__%(.{id,playlist_index,playlist_count,n_entries,format_id})j')
         $args.Add('--progress')
         $args.Add('-o'); $args.Add((Join-Path $destination '%(playlist_index&{} - |)s%(title)s [%(id)s].%(ext)s'))
-        if ($playlistCheck.Checked) { $args.Add('--yes-playlist') } else { $args.Add('--no-playlist') }
+        $playlistRequested = if ($TrackerConfiguration) { $true } else { [bool]$playlistCheck.Checked }
+        if ($TrackerConfiguration) {
+            if ([string]::IsNullOrWhiteSpace($TrackerArchivePath)) { throw '追蹤下載缺少 archive 路徑。' }
+            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $TrackerArchivePath) | Out-Null
+            $args.Add('--download-archive'); $args.Add($TrackerArchivePath)
+        }
+        if ($playlistRequested) { $args.Add('--yes-playlist') } else { $args.Add('--no-playlist') }
         $args.Add($url)
 
         Write-Log "開始下載：格式 $format，模式 $qualityMode，輸出至 $destination"
@@ -1522,7 +1812,7 @@ function Start-Download {
             Write-Log '[Auth] Download mode: none'
             $authSummary = 'none'
         }
-        $playlistMode = if ($playlistCheck.Checked) { 'yes-playlist' } else { 'no-playlist' }
+        $playlistMode = if ($playlistRequested) { 'yes-playlist' } else { 'no-playlist' }
         Write-Log "[Command] format=$formatSelector; client=$downloadClient; auth=$authSummary; deno=$Deno; playlist=$playlistMode"
 
         $psi = [System.Diagnostics.ProcessStartInfo]::new()
@@ -1556,8 +1846,11 @@ function Start-Download {
             ProviderSession = $providerSession
             Authentication = $authentication
             ProviderFailure = $null
-            PlaylistRequested = [bool]$playlistCheck.Checked
+            PlaylistRequested = $playlistRequested
             Statistics = $downloadStatistics
+            TrackerConfiguration = $TrackerConfiguration
+            TrackerConfigPath = $TrackerConfigPath
+            TrackerArchivePath = $TrackerArchivePath
             NextHealthCheck = (Get-Date).AddSeconds(5)
             RetryAt = $null
             HealthRequest = $null
@@ -1569,7 +1862,12 @@ function Start-Download {
         $downloadTimer.Start()
     } catch {
         Write-Log "錯誤：$($_.Exception.Message)"
-        [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '下載失敗', 'OK', 'Error') | Out-Null
+        if ($TrackerConfiguration) {
+            Write-Log '[Tracker] Check failed before playlist processing'
+            Write-Log "[Tracker] Reason: $($_.Exception.Message)"
+        } else {
+            [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '下載失敗', 'OK', 'Error') | Out-Null
+        }
         Close-DownloadJob
         if ($providerSession) { Stop-PoTokenProvider }
         $Script:ActiveProcess = $null
@@ -1579,6 +1877,10 @@ function Start-Download {
         $startButton.Enabled = $true
         $cancelButton.Enabled = $false
         $cancelButton.Text = '停止'
+        if ($TrackerConfiguration) {
+            try { Update-TrackedPlaylistTimestamps $TrackerConfigPath $false } catch { Write-Log "[Tracker] 無法更新檢查時間：$($_.Exception.Message)" }
+            Start-NextTrackedPlaylistCheck
+        }
     }
 }
 
@@ -1659,6 +1961,9 @@ $startButton = [System.Windows.Forms.Button]@{ Text='開始下載'; AutoSize=$tr
 $cancelButton = [System.Windows.Forms.Button]@{ Text='停止'; AutoSize=$true; Enabled=$false }
 $openButton = [System.Windows.Forms.Button]@{ Text='開啟下載資料夾'; AutoSize=$true }
 $updateButton = [System.Windows.Forms.Button]@{ Text='更新 yt-dlp'; AutoSize=$true }
+$trackAddButton = [System.Windows.Forms.Button]@{ Text='加入追蹤播放清單'; AutoSize=$true }
+$trackCheckButton = [System.Windows.Forms.Button]@{ Text='檢查追蹤播放清單'; AutoSize=$true }
+$trackListButton = [System.Windows.Forms.Button]@{ Text='查看追蹤清單'; AutoSize=$true }
 $downloadTimer = [System.Windows.Forms.Timer]::new()
 $downloadTimer.Interval = 100
 $downloadTimer.Add_Tick({
@@ -1672,7 +1977,10 @@ $startButton.Add_Click({ Start-Download })
 $cancelButton.Add_Click({ Show-DownloadControlDialog })
 $openButton.Add_Click({ New-Item -ItemType Directory -Force -Path $folderBox.Text | Out-Null; Start-Process explorer.exe $folderBox.Text })
 $updateButton.Add_Click({ Update-YtDlp })
-$buttonLine.Controls.AddRange(@($startButton,$cancelButton,$openButton,$updateButton)); $panel.Controls.Add($buttonLine,1,9)
+$trackAddButton.Add_Click({ Add-TrackedPlaylist })
+$trackCheckButton.Add_Click({ Start-TrackedPlaylistBatch })
+$trackListButton.Add_Click({ Show-TrackedPlaylistList })
+$buttonLine.Controls.AddRange(@($startButton,$cancelButton,$openButton,$updateButton,$trackCheckButton,$trackAddButton,$trackListButton)); $panel.Controls.Add($buttonLine,1,9)
 
 Write-Log '就緒。保留來源最佳品質時，依序優先使用 774 → 141 → 251；只有「重新編碼」模式才會套用音訊格式與轉碼品質設定。'
-[void]$form.ShowDialog()
+if ($env:YAD_TEST_NO_SHOW -ne '1') { [void]$form.ShowDialog() }

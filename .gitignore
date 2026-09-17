@@ -12,6 +12,7 @@
 
 # Authentication files: never commit browser sessions
 /data/auth/
+/data/tracked-playlists/
 *cookie*
 *Cookie*
 *.txt

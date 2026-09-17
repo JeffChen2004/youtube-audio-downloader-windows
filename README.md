@@ -13,6 +13,15 @@ Windows 圖形介面工具，支援影片或播放清單、音訊格式與品質
 
 下載 Opus 時，紀錄中可能先出現 `.webm`：這是 YouTube 提供的原始音訊容器，完成後會由 FFmpeg 轉封裝為 `.opus`。不需手動處理暫存檔。
 
+## 播放清單追蹤
+
+主畫面底部提供「加入追蹤播放清單」、「檢查追蹤播放清單」與「查看追蹤清單」。加入時可選擇：
+
+- **從現在開始追蹤**：以 yt-dlp 原生 `--force-write-archive` 初始化目前項目，不下載既有內容。
+- **補齊目前播放清單**：建立空白追蹤狀態後，立即透過既有下載流程補齊尚未成功下載的項目。
+
+每個播放清單的設定與 archive 分別儲存在 `data/tracked-playlists/<playlist_id>.json` 和 `<playlist_id>.archive.txt`。檢查時使用設定內保存的認證模式與輸出資料夾，並以 `--download-archive` 判斷新增項目；檔名、播放清單順序與本機音訊是否仍存在都不作為已下載判斷依據。這個資料夾屬於本機狀態，已排除於 Git。
+
 「檢查格式」會以 `yt-dlp -J` 依序探測 `Auto`、`web_music`、`web`、`mweb` 四種 YouTube player client，並從每個 client 的 audio-only 格式選出實際 abr 最高的 Opus。若 Auto 已達 250 kbps 以上會提前停止，以減少請求。工具快取探測結果；只有網址、cookies.txt 路徑或登入瀏覽器改變時才會失效。若找不到原始 Opus，工具會先詢問你是否下載其他最高品質的原始音訊，不會自動重新編碼。
 
 「詳細診斷」只測 `Auto` 與 `web_music`，並將 yt-dlp 的完整 verbose 輸出寫入 `logs\probe-debug-YYYYMMDD-HHMMSS.txt`。GUI 只顯示版本、cookies、登入／Premium 訊號、PO Token、SABR、格式與 JS/EJS 警告的摘要；未出現的訊號會標為 `Unknown` 或 `None reported`，不會推測原因。可用「更新 yt-dlp」按鈕從官方 release 手動取得最新版。
