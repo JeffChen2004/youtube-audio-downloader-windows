@@ -22,6 +22,27 @@ Windows 圖形介面工具，支援影片或播放清單、音訊格式與品質
 
 每個播放清單的設定與 archive 分別儲存在 `data/tracked-playlists/<playlist_id>.json` 和 `<playlist_id>.archive.txt`。檢查時使用設定內保存的認證模式與輸出資料夾，並以 `--download-archive` 判斷新增項目；檔名、播放清單順序與本機音訊是否仍存在都不作為已下載判斷依據。這個資料夾屬於本機狀態，已排除於 Git。
 
+可在不開啟 GUI 的情況下手動檢查所有已啟用項目：
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\PlaylistMonitor.ps1 -CheckAll
+# 或
+pwsh.exe -File .\PlaylistMonitor.ps1 -CheckAll
+```
+
+Monitor 使用 `$PSScriptRoot` 尋找工具與狀態，不依賴目前工作目錄。每次執行的紀錄位於 `logs/playlist-monitor/`；named mutex 會避免兩份 Monitor 同時修改 archive。
+
+Windows Task Scheduler 可透過獨立管理工具安裝、查詢、立即執行或移除：
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\PlaylistMonitorTask.ps1 -Install
+powershell.exe -ExecutionPolicy Bypass -File .\PlaylistMonitorTask.ps1 -Status
+powershell.exe -ExecutionPolicy Bypass -File .\PlaylistMonitorTask.ps1 -RunNow
+powershell.exe -ExecutionPolicy Bypass -File .\PlaylistMonitorTask.ps1 -Remove
+```
+
+預設每 60 分鐘執行；安裝時可用 `-IntervalMinutes 30` 至 `1440` 調整。Task 只在目前使用者已登入時執行、不要求系統管理員權限、不喚醒電腦，並允許使用電池時執行。
+
 「檢查格式」會以 `yt-dlp -J` 依序探測 `Auto`、`web_music`、`web`、`mweb` 四種 YouTube player client，並從每個 client 的 audio-only 格式選出實際 abr 最高的 Opus。若 Auto 已達 250 kbps 以上會提前停止，以減少請求。工具快取探測結果；只有網址、cookies.txt 路徑或登入瀏覽器改變時才會失效。若找不到原始 Opus，工具會先詢問你是否下載其他最高品質的原始音訊，不會自動重新編碼。
 
 「詳細診斷」只測 `Auto` 與 `web_music`，並將 yt-dlp 的完整 verbose 輸出寫入 `logs\probe-debug-YYYYMMDD-HHMMSS.txt`。GUI 只顯示版本、cookies、登入／Premium 訊號、PO Token、SABR、格式與 JS/EJS 警告的摘要；未出現的訊號會標為 `Unknown` 或 `None reported`，不會推測原因。可用「更新 yt-dlp」按鈕從官方 release 手動取得最新版。

@@ -48,6 +48,13 @@ function Get-TrackedPlaylistConfigurations {
     if (-not (Test-Path -LiteralPath $Script:TrackedPlaylistsRoot -PathType Container)) { return @() }
     $items = [System.Collections.Generic.List[object]]::new()
     foreach ($file in @(Get-ChildItem -LiteralPath $Script:TrackedPlaylistsRoot -Filter '*.json' -File | Sort-Object Name)) {
+        # Dotfiles and conventional temporary/backup JSON names are support
+        # artifacts, not tracker configurations. Save-TrackedPlaylistConfiguration
+        # also writes <name>.json.<guid>.tmp, which never matches *.json.
+        if ($file.Name.StartsWith('.', [System.StringComparison]::Ordinal) -or
+            $file.Name -match '(?i)\.(?:tmp|bak|backup|partial|new)\.json$') {
+            continue
+        }
         try {
             $items.Add([pscustomobject]@{ Path = $file.FullName; Configuration = (Read-TrackedPlaylistConfiguration $file.FullName); Error = '' })
         } catch {

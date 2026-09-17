@@ -3,8 +3,17 @@
   Downloads publicly accessible / account-authorized audio using yt-dlp and FFmpeg.
 #>
 
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
+param(
+    [string]$HeadlessTrackedConfig = '',
+    [string]$HeadlessResultPath = ''
+)
+
+$Script:HeadlessMode = -not [string]::IsNullOrWhiteSpace($HeadlessTrackedConfig)
+
+if (-not $Script:HeadlessMode) {
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+}
 if (-not ('YtAudioDownloader.LoggedProcess' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
@@ -263,7 +272,7 @@ namespace YtAudioDownloader {
 }
 '@
 }
-[System.Windows.Forms.Application]::EnableVisualStyles()
+if (-not $Script:HeadlessMode) { [System.Windows.Forms.Application]::EnableVisualStyles() }
 
 $ErrorActionPreference = 'Stop'
 $AppRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -296,12 +305,23 @@ $Script:LastPoTokenSetupLines = @()
 $Script:PoTokenProviderProcess = $null
 $Script:TrackedPlaylistQueue = [System.Collections.Generic.Queue[object]]::new()
 $Script:TrackerBatchActive = $false
+$Script:HeadlessLastResult = $null
+$Script:GuiLogChannel = 'Download'
+
+function Invoke-UiEvents {
+    if (-not $Script:HeadlessMode) { [System.Windows.Forms.Application]::DoEvents() }
+}
 
 function Write-Log([string]$Message) {
-    $log.AppendText("[$(Get-Date -Format 'HH:mm:ss')] $Message`r`n")
-    $log.SelectionStart = $log.TextLength
-    $log.ScrollToCaret()
-    [System.Windows.Forms.Application]::DoEvents()
+    if ($Script:HeadlessMode) {
+        [Console]::Out.WriteLine("[$(Get-Date -Format 'HH:mm:ss')] $Message")
+        return
+    }
+    $targetLog = if ($Script:GuiLogChannel -eq 'Tracker' -and $trackerLog) { $trackerLog } else { $log }
+    $targetLog.AppendText("[$(Get-Date -Format 'HH:mm:ss')] $Message`r`n")
+    $targetLog.SelectionStart = $targetLog.TextLength
+    $targetLog.ScrollToCaret()
+    Invoke-UiEvents
 }
 
 # ProcessStartInfo.ArgumentList only exists in PowerShell 7/.NET Core.  This
@@ -321,7 +341,7 @@ function Invoke-CapturedProcess([string]$FileName, [string[]]$Arguments, [string
     $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.CreateNoWindow = $true
     $psi.Arguments = (($Arguments | ForEach-Object { ConvertTo-ProcessArgument $_ }) -join ' ')
     $process = [YtAudioDownloader.LoggedProcess]::new(); $process.Start($psi)
-    while (-not $process.Process.HasExited) { [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 80 }
+    while (-not $process.Process.HasExited) { Invoke-UiEvents; Start-Sleep -Milliseconds 80 }
     $process.Process.WaitForExit()
     $stdout = [System.Collections.Generic.List[string]]::new(); $stderr = [System.Collections.Generic.List[string]]::new(); $line = $null
     while ($process.OutputLines.TryDequeue([ref]$line)) { $stdout.Add($line) }
@@ -463,7 +483,7 @@ function Ensure-PoTokenProvider {
             $nextUpdate = 10
             $deadline = (Get-Date).AddSeconds(120)
             while ((Get-Date) -lt $deadline -and -not $serverReady -and -not $providerProcess.Process.HasExited) {
-                Start-Sleep -Milliseconds 250; [System.Windows.Forms.Application]::DoEvents()
+                Start-Sleep -Milliseconds 250; Invoke-UiEvents
                 $serverReady = Test-PoTokenProviderPing $providerBaseUrl
                 $line = $null
                 while ($providerProcess.Lines.TryDequeue([ref]$line)) { $setupLines.Add("[provider] $(Protect-PoTokenLogLine $line)") }
@@ -741,7 +761,7 @@ function Probe-AudioFormats([string]$Url, [string]$Client, $Cookies, [string]$De
     $loggedProcess = [YtAudioDownloader.LoggedProcess]::new()
     $loggedProcess.Start($psi)
     while (-not $loggedProcess.Process.HasExited) {
-        [System.Windows.Forms.Application]::DoEvents()
+        Invoke-UiEvents
         Start-Sleep -Milliseconds 80
     }
     $loggedProcess.Process.WaitForExit()
@@ -1036,12 +1056,12 @@ function Show-TrackerAddModeDialog {
     } finally { $dialog.Dispose() }
 }
 
-function Add-TrackedPlaylist {
+function Add-TrackedPlaylist([string]$PlaylistUrl = '') {
     if ($Script:DownloadState -ne 'Idle') {
         [System.Windows.Forms.MessageBox]::Show('請先等待目前下載工作結束。', '播放清單追蹤', 'OK', 'Information') | Out-Null
         return
     }
-    $url = $urlBox.Text.Trim()
+    $url = if ([string]::IsNullOrWhiteSpace($PlaylistUrl)) { $urlBox.Text.Trim() } else { $PlaylistUrl.Trim() }
     if ([string]::IsNullOrWhiteSpace($url)) {
         [System.Windows.Forms.MessageBox]::Show('請先輸入 YouTube 播放清單網址。', '播放清單追蹤', 'OK', 'Warning') | Out-Null
         return
@@ -1090,20 +1110,10 @@ function Add-TrackedPlaylist {
         Write-Log '[Tracker] Check failed before playlist processing'
         Write-Log "[Tracker] Reason: $($_.Exception.Message)"
         [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '加入追蹤失敗', 'OK', 'Error') | Out-Null
-    } finally { $trackAddButton.Enabled = $true }
-}
-
-function Show-TrackedPlaylistList {
-    $dialog = [System.Windows.Forms.Form]@{ Text='追蹤播放清單'; Size=[System.Drawing.Size]::new(760,390); StartPosition='CenterParent'; ShowInTaskbar=$false }
-    $grid = [System.Windows.Forms.DataGridView]@{ Dock='Fill'; ReadOnly=$true; AllowUserToAddRows=$false; AllowUserToDeleteRows=$false; AutoSizeColumnsMode='Fill'; RowHeadersVisible=$false; SelectionMode='FullRowSelect' }
-    [void]$grid.Columns.Add('Enabled','啟用'); [void]$grid.Columns.Add('Title','播放清單'); [void]$grid.Columns.Add('Auth','登入'); [void]$grid.Columns.Add('LastChecked','上次檢查'); [void]$grid.Columns.Add('Output','輸出資料夾')
-    foreach ($item in @(Get-TrackedPlaylistConfigurations)) {
-        if ($item.Configuration) {
-            $c=$item.Configuration; [void]$grid.Rows.Add([string]$c.enabled,[string]$c.playlist_title,[string]$c.auth_mode,[string]$c.last_checked_at,[string]$c.output_folder)
-        } else { [void]$grid.Rows.Add('錯誤',[System.IO.Path]::GetFileName($item.Path),'', $item.Error,'') }
+    } finally {
+        $trackAddButton.Enabled = $true
+        if (Get-Command Refresh-TrackedPlaylistGrid -ErrorAction SilentlyContinue) { Refresh-TrackedPlaylistGrid }
     }
-    $dialog.Controls.Add($grid)
-    try { [void]$dialog.ShowDialog($form) } finally { $dialog.Dispose() }
 }
 
 function Start-TrackedPlaylistBatch([string[]]$ConfigPaths = @()) {
@@ -1130,7 +1140,9 @@ function Start-NextTrackedPlaylistCheck {
     if ($Script:TrackedPlaylistQueue.Count -eq 0) {
         $Script:TrackerBatchActive = $false
         $trackCheckButton.Enabled = $true
+        if ($trackSelectedButton) { $trackSelectedButton.Enabled = $true }
         Write-Log '[Tracker] 所有已啟用的追蹤播放清單檢查完成。'
+        if (Get-Command Refresh-TrackedPlaylistGrid -ErrorAction SilentlyContinue) { Refresh-TrackedPlaylistGrid }
         return
     }
     $path = [string]$Script:TrackedPlaylistQueue.Dequeue()
@@ -1618,7 +1630,9 @@ function Complete-DownloadSession($Context) {
     try {
         if ($Context.ProviderFailure) {
             Write-Log "錯誤：$($Context.ProviderFailure)"
-            [System.Windows.Forms.MessageBox]::Show($Context.ProviderFailure, '下載失敗', 'OK', 'Error') | Out-Null
+            if (-not $Script:HeadlessMode) {
+                [System.Windows.Forms.MessageBox]::Show($Context.ProviderFailure, '下載失敗', 'OK', 'Error') | Out-Null
+            }
         } elseif ($Script:DownloadCancelled) {
             Write-Log '[Download] Download terminated'
         } elseif ($Script:ActiveProcess.ExitCode -eq 0) {
@@ -1635,6 +1649,16 @@ function Complete-DownloadSession($Context) {
             Write-TrackedPlaylistSummary $Context.TrackerConfiguration $Context.Statistics $Script:DownloadCancelled $processFailed
             try { Update-TrackedPlaylistTimestamps $Context.TrackerConfigPath $trackerSuccessful }
             catch { Write-Log "[Tracker] 無法更新檢查時間：$($_.Exception.Message)" }
+            if ($Script:HeadlessMode) {
+                $Script:HeadlessLastResult = [pscustomobject]@{
+                    success = $trackerSuccessful
+                    new_videos_downloaded = $Context.Statistics.Success.Count
+                    no_change = ($trackerSuccessful -and $Context.Statistics.Success.Count -eq 0)
+                    failed_items = $Context.Statistics.Failed.Count
+                    skipped_items = $Context.Statistics.Skipped.Count
+                    reason = if ($Context.ProviderFailure) { [string]$Context.ProviderFailure } elseif ($Context.Statistics.JobFailureReason) { [string]$Context.Statistics.JobFailureReason } elseif ($processFailed) { "yt-dlp exit code $($Script:ActiveProcess.ExitCode)" } else { '' }
+                }
+            }
         }
         $Script:ActiveProcess = $null
         $Script:SuspendedDownloadPids = @()
@@ -1859,7 +1883,12 @@ function Start-Download {
             HealthStarted = $null
             ExitObservedAt = $null
         }
-        $downloadTimer.Start()
+        if ($Script:HeadlessMode) {
+            while ($Script:DownloadState -ne 'Idle') {
+                Update-DownloadSession
+                Start-Sleep -Milliseconds 100
+            }
+        } else { $downloadTimer.Start() }
     } catch {
         Write-Log "錯誤：$($_.Exception.Message)"
         if ($TrackerConfiguration) {
@@ -1878,20 +1907,97 @@ function Start-Download {
         $cancelButton.Enabled = $false
         $cancelButton.Text = '停止'
         if ($TrackerConfiguration) {
+            if ($Script:HeadlessMode) {
+                $Script:HeadlessLastResult = [pscustomobject]@{
+                    success = $false
+                    new_videos_downloaded = 0
+                    no_change = $false
+                    failed_items = 0
+                    skipped_items = 0
+                    reason = $_.Exception.Message
+                }
+            }
             try { Update-TrackedPlaylistTimestamps $TrackerConfigPath $false } catch { Write-Log "[Tracker] 無法更新檢查時間：$($_.Exception.Message)" }
             Start-NextTrackedPlaylistCheck
         }
     }
 }
 
-$form = [System.Windows.Forms.Form]@{ Text = 'YouTube 音訊下載器'; Size = [System.Drawing.Size]::new(820, 680); StartPosition = 'CenterScreen'; MinimumSize = [System.Drawing.Size]::new(820,620); Font = [System.Drawing.Font]::new('Microsoft JhengHei UI', 10) }
+function Write-HeadlessDownloadResult([string]$Path, $Result) {
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
+    $directory = Split-Path -Parent $Path
+    if (-not [string]::IsNullOrWhiteSpace($directory)) { New-Item -ItemType Directory -Force -Path $directory | Out-Null }
+    $temporaryPath = $Path + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
+    try {
+        [System.IO.File]::WriteAllText($temporaryPath, (($Result | ConvertTo-Json -Depth 6) + "`r`n"), [System.Text.UTF8Encoding]::new($false))
+        Move-Item -LiteralPath $temporaryPath -Destination $Path -Force
+    } finally {
+        if (Test-Path -LiteralPath $temporaryPath) { Remove-Item -LiteralPath $temporaryPath -Force }
+    }
+}
+
+if ($Script:HeadlessMode) {
+    # Minimal non-visual state objects used by the existing download pipeline.
+    # No WinForms assembly, Form, timer, picker, or MessageBox is created.
+    $startButton = [pscustomobject]@{ Enabled = $true }
+    $cancelButton = [pscustomobject]@{ Enabled = $false; Text = '停止' }
+    $trackCheckButton = [pscustomobject]@{ Enabled = $true }
+    $downloadTimer = [pscustomobject]@{}
+    $downloadTimer | Add-Member -MemberType ScriptMethod -Name Start -Value { }
+    $downloadTimer | Add-Member -MemberType ScriptMethod -Name Stop -Value { }
+
+    $headlessExitCode = 1
+    try {
+        $resolvedConfigPath = (Resolve-Path -LiteralPath $HeadlessTrackedConfig).Path
+        Invoke-TrackedPlaylistCheck $resolvedConfigPath
+        if (-not $Script:HeadlessLastResult) {
+            throw 'Headless tracker 沒有產生執行結果。'
+        }
+        $headlessExitCode = if ($Script:HeadlessLastResult.success) { 0 } else { 1 }
+    } catch {
+        Write-Log "[Tracker] Headless check failed: $($_.Exception.Message)"
+        $Script:HeadlessLastResult = [pscustomobject]@{
+            success = $false
+            new_videos_downloaded = 0
+            no_change = $false
+            failed_items = 0
+            skipped_items = 0
+            reason = $_.Exception.Message
+        }
+        $headlessExitCode = 1
+    }
+    $loadedAssemblyNames = @([AppDomain]::CurrentDomain.GetAssemblies() | ForEach-Object { $_.GetName().Name })
+    $resultEnvelope = [ordered]@{
+        success = [bool]$Script:HeadlessLastResult.success
+        new_videos_downloaded = [int]$Script:HeadlessLastResult.new_videos_downloaded
+        no_change = [bool]$Script:HeadlessLastResult.no_change
+        failed_items = [int]$Script:HeadlessLastResult.failed_items
+        skipped_items = [int]$Script:HeadlessLastResult.skipped_items
+        reason = [string]$Script:HeadlessLastResult.reason
+        winforms_loaded = ($loadedAssemblyNames -contains 'System.Windows.Forms')
+    }
+    try { Write-HeadlessDownloadResult $HeadlessResultPath $resultEnvelope }
+    catch {
+        [Console]::Error.WriteLine("[Tracker] Unable to write headless result: $($_.Exception.Message)")
+        $headlessExitCode = 1
+    }
+    exit $headlessExitCode
+}
+
+$form = [System.Windows.Forms.Form]@{ Text = 'YouTube 音訊下載器'; Size = [System.Drawing.Size]::new(980, 760); StartPosition = 'CenterScreen'; MinimumSize = [System.Drawing.Size]::new(900,680); Font = [System.Drawing.Font]::new('Microsoft JhengHei UI', 10) }
+$tabControl = [System.Windows.Forms.TabControl]@{ Dock='Fill'; Padding=[System.Drawing.Point]::new(14,5) }
+$downloadTab = [System.Windows.Forms.TabPage]@{ Text='下載'; Padding=[System.Windows.Forms.Padding]::new(3) }
+$trackerTab = [System.Windows.Forms.TabPage]@{ Text='播放清單追蹤'; Padding=[System.Windows.Forms.Padding]::new(3) }
+$tabControl.TabPages.AddRange(@($downloadTab,$trackerTab))
+$form.Controls.Add($tabControl)
+
 $panel = [System.Windows.Forms.TableLayoutPanel]@{ Dock = 'Fill'; Padding = [System.Windows.Forms.Padding]::new(18); ColumnCount = 2; RowCount = 10 }
 [void]$panel.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Absolute, 118))
 [void]$panel.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Percent, 100))
 1..8 | ForEach-Object { [void]$panel.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::AutoSize)) }
 [void]$panel.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Percent, 100))
 [void]$panel.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::AutoSize))
-$form.Controls.Add($panel)
+$downloadTab.Controls.Add($panel)
 $form.Add_FormClosed({
     if ($downloadTimer) { $downloadTimer.Stop() }
     if ($Script:DownloadState -in @('Running', 'Paused')) {
@@ -1961,9 +2067,187 @@ $startButton = [System.Windows.Forms.Button]@{ Text='開始下載'; AutoSize=$tr
 $cancelButton = [System.Windows.Forms.Button]@{ Text='停止'; AutoSize=$true; Enabled=$false }
 $openButton = [System.Windows.Forms.Button]@{ Text='開啟下載資料夾'; AutoSize=$true }
 $updateButton = [System.Windows.Forms.Button]@{ Text='更新 yt-dlp'; AutoSize=$true }
-$trackAddButton = [System.Windows.Forms.Button]@{ Text='加入追蹤播放清單'; AutoSize=$true }
-$trackCheckButton = [System.Windows.Forms.Button]@{ Text='檢查追蹤播放清單'; AutoSize=$true }
-$trackListButton = [System.Windows.Forms.Button]@{ Text='查看追蹤清單'; AutoSize=$true }
+$buttonLine.Controls.AddRange(@($startButton,$cancelButton,$openButton,$updateButton)); $panel.Controls.Add($buttonLine,1,9)
+
+# The tracker tab is a local-state management surface. Refreshing it reads
+# tracker JSON/archive files only and never contacts YouTube.
+$trackerPanel = [System.Windows.Forms.TableLayoutPanel]@{ Dock='Fill'; Padding=[System.Windows.Forms.Padding]::new(12); ColumnCount=1; RowCount=4 }
+[void]$trackerPanel.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Percent,48))
+[void]$trackerPanel.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::AutoSize))
+[void]$trackerPanel.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::AutoSize))
+[void]$trackerPanel.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Percent,52))
+$trackerTab.Controls.Add($trackerPanel)
+
+$trackerGrid = [System.Windows.Forms.DataGridView]@{ Dock='Fill'; ReadOnly=$true; AllowUserToAddRows=$false; AllowUserToDeleteRows=$false; AllowUserToResizeRows=$false; RowHeadersVisible=$false; SelectionMode='FullRowSelect'; MultiSelect=$false; AutoSizeColumnsMode='Fill'; Margin=[System.Windows.Forms.Padding]::new(3,3,3,8) }
+[void]$trackerGrid.Columns.Add('Title','播放清單名稱')
+[void]$trackerGrid.Columns.Add('Enabled','Enabled')
+[void]$trackerGrid.Columns.Add('Auth','Auth Mode')
+[void]$trackerGrid.Columns.Add('LastChecked','上次檢查時間')
+[void]$trackerGrid.Columns.Add('LastSuccess','上次成功時間')
+[void]$trackerGrid.Columns.Add('Output','輸出資料夾')
+[void]$trackerGrid.Columns.Add('ArchiveCount','Archive 項目數')
+$trackerGrid.Columns['Title'].FillWeight=125; $trackerGrid.Columns['Enabled'].FillWeight=55; $trackerGrid.Columns['Auth'].FillWeight=75
+$trackerGrid.Columns['LastChecked'].FillWeight=90; $trackerGrid.Columns['LastSuccess'].FillWeight=90; $trackerGrid.Columns['Output'].FillWeight=135; $trackerGrid.Columns['ArchiveCount'].FillWeight=65
+$trackerPanel.Controls.Add($trackerGrid,0,0)
+
+$trackerButtonLine = [System.Windows.Forms.FlowLayoutPanel]@{ Dock='Fill'; AutoSize=$true; WrapContents=$true; Margin=[System.Windows.Forms.Padding]::new(3,0,3,8) }
+$trackAddButton = [System.Windows.Forms.Button]@{ Text='加入播放清單'; AutoSize=$true }
+$trackEditButton = [System.Windows.Forms.Button]@{ Text='編輯'; AutoSize=$true }
+$trackToggleButton = [System.Windows.Forms.Button]@{ Text='啟用 / 停用'; AutoSize=$true }
+$trackRemoveButton = [System.Windows.Forms.Button]@{ Text='移除'; AutoSize=$true }
+$trackSelectedButton = [System.Windows.Forms.Button]@{ Text='檢查選取項目'; AutoSize=$true }
+$trackCheckButton = [System.Windows.Forms.Button]@{ Text='立即檢查全部'; AutoSize=$true }
+$trackerButtonLine.Controls.AddRange(@($trackAddButton,$trackEditButton,$trackToggleButton,$trackRemoveButton,$trackSelectedButton,$trackCheckButton))
+$trackerPanel.Controls.Add($trackerButtonLine,0,1)
+
+$automationGroup = [System.Windows.Forms.GroupBox]@{ Text='自動追蹤'; Dock='Fill'; AutoSize=$true; Padding=[System.Windows.Forms.Padding]::new(10); Margin=[System.Windows.Forms.Padding]::new(3,0,3,8) }
+$automationLayout = [System.Windows.Forms.TableLayoutPanel]@{ Dock='Fill'; AutoSize=$true; ColumnCount=1; RowCount=3 }
+[void]$automationLayout.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Percent,100))
+[void]$automationLayout.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::AutoSize))
+[void]$automationLayout.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::AutoSize))
+[void]$automationLayout.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::AutoSize))
+$automationStatusLabel = [System.Windows.Forms.Label]@{ Text='正在讀取排程狀態…'; AutoSize=$true; Anchor='Left'; Margin=[System.Windows.Forms.Padding]::new(3,3,3,7) }
+$automationControls = [System.Windows.Forms.FlowLayoutPanel]@{ Dock='Fill'; AutoSize=$true; WrapContents=$false; Margin=[System.Windows.Forms.Padding]::new(0,0,0,5) }
+$intervalLabel = [System.Windows.Forms.Label]@{ Text='檢查間隔：'; AutoSize=$true; Margin=[System.Windows.Forms.Padding]::new(3,8,3,3) }
+$intervalBox = [System.Windows.Forms.ComboBox]@{ DropDownStyle='DropDownList'; Width=120; Margin=[System.Windows.Forms.Padding]::new(0,4,12,3) }
+[void]$intervalBox.Items.AddRange(@('30 分鐘','60 分鐘','120 分鐘','180 分鐘','360 分鐘','720 分鐘','1440 分鐘'))
+$intervalBox.SelectedItem='60 分鐘'
+$taskApplyButton = [System.Windows.Forms.Button]@{ Text='套用排程'; AutoSize=$true }
+$taskRemoveButton = [System.Windows.Forms.Button]@{ Text='停用自動追蹤'; AutoSize=$true }
+$taskRunNowButton = [System.Windows.Forms.Button]@{ Text='立即執行'; AutoSize=$true }
+$automationControls.Controls.AddRange(@($intervalLabel,$intervalBox,$taskApplyButton,$taskRemoveButton,$taskRunNowButton))
+$automationHint = [System.Windows.Forms.Label]@{ Text="「啟用播放清單」決定 Monitor 執行時是否檢查該清單；「自動追蹤」決定 Windows 是否定時啟動 Monitor。"; AutoSize=$true; ForeColor=[System.Drawing.Color]::DimGray; Margin=[System.Windows.Forms.Padding]::new(3,0,3,3) }
+$automationLayout.Controls.Add($automationStatusLabel,0,0); $automationLayout.Controls.Add($automationControls,0,1); $automationLayout.Controls.Add($automationHint,0,2)
+$automationGroup.Controls.Add($automationLayout); $trackerPanel.Controls.Add($automationGroup,0,2)
+
+$trackerLogGroup = [System.Windows.Forms.GroupBox]@{ Text='Tracker / Monitor 執行紀錄'; Dock='Fill'; Padding=[System.Windows.Forms.Padding]::new(8) }
+$trackerLog = [System.Windows.Forms.TextBox]@{ Dock='Fill'; Multiline=$true; ScrollBars='Vertical'; ReadOnly=$true; BackColor=[System.Drawing.Color]::FromArgb(28,31,35); ForeColor=[System.Drawing.Color]::Gainsboro; Font=[System.Drawing.Font]::new('Consolas',9) }
+$trackerLogGroup.Controls.Add($trackerLog); $trackerPanel.Controls.Add($trackerLogGroup,0,3)
+
+function Format-TrackerDate([object]$Value) {
+    if ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)) { return '—' }
+    try { return ([datetime]::Parse([string]$Value).ToLocalTime().ToString('yyyy-MM-dd HH:mm')) } catch { return [string]$Value }
+}
+
+function Get-TrackerArchiveCount([string]$PlaylistId) {
+    try {
+        $paths = Get-TrackedPlaylistStatePaths $PlaylistId
+        if (-not (Test-Path -LiteralPath $paths.ArchivePath -PathType Leaf)) { return 0 }
+        return @([System.IO.File]::ReadLines($paths.ArchivePath) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and -not $_.StartsWith('#') }).Count
+    } catch { return '錯誤' }
+}
+
+function Refresh-TrackedPlaylistGrid {
+    if (-not $trackerGrid) { return }
+    $trackerGrid.Rows.Clear()
+    foreach ($item in @(Get-TrackedPlaylistConfigurations)) {
+        if ($item.Configuration) {
+            $c = $item.Configuration
+            $rowIndex = $trackerGrid.Rows.Add(
+                [string]$c.playlist_title,
+                $(if ([bool]$c.enabled) { '是' } else { '否' }),
+                [string]$c.auth_mode,
+                (Format-TrackerDate $c.last_checked_at),
+                (Format-TrackerDate $c.last_success_at),
+                [string]$c.output_folder,
+                (Get-TrackerArchiveCount ([string]$c.playlist_id))
+            )
+            $trackerGrid.Rows[$rowIndex].Tag = $item.Path
+        } else {
+            $rowIndex = $trackerGrid.Rows.Add([System.IO.Path]::GetFileName($item.Path),'錯誤','—','—','—',$item.Error,'—')
+            $trackerGrid.Rows[$rowIndex].DefaultCellStyle.ForeColor = [System.Drawing.Color]::Firebrick
+        }
+    }
+}
+
+function Get-SelectedTrackerPath {
+    if ($trackerGrid.SelectedRows.Count -eq 0) { return '' }
+    return [string]$trackerGrid.SelectedRows[0].Tag
+}
+
+function Show-TrackerUrlDialog {
+    $dialog=[System.Windows.Forms.Form]@{Text='加入播放清單';Size=[System.Drawing.Size]::new(640,205);StartPosition='CenterParent';FormBorderStyle='FixedDialog';MaximizeBox=$false;MinimizeBox=$false;ShowInTaskbar=$false}
+    $label=[System.Windows.Forms.Label]@{Text='YouTube 播放清單網址';AutoSize=$true;Location=[System.Drawing.Point]::new(18,18)}
+    $box=[System.Windows.Forms.TextBox]@{Location=[System.Drawing.Point]::new(20,48);Width=585}
+    $hint=[System.Windows.Forms.Label]@{Text='登入、品質與輸出設定會沿用「下載」Tab 目前的選項。';AutoSize=$true;ForeColor=[System.Drawing.Color]::DimGray;Location=[System.Drawing.Point]::new(20,82)}
+    $ok=[System.Windows.Forms.Button]@{Text='下一步';DialogResult='OK';Location=[System.Drawing.Point]::new(435,118);Size=[System.Drawing.Size]::new(80,30)}
+    $cancel=[System.Windows.Forms.Button]@{Text='取消';DialogResult='Cancel';Location=[System.Drawing.Point]::new(525,118);Size=[System.Drawing.Size]::new(80,30)}
+    $dialog.Controls.AddRange(@($label,$box,$hint,$ok,$cancel));$dialog.AcceptButton=$ok;$dialog.CancelButton=$cancel
+    try { if($dialog.ShowDialog($form)-ne 'OK'){return ''};return $box.Text.Trim() } finally { $dialog.Dispose() }
+}
+
+function Show-TrackerEditDialog([string]$ConfigPath) {
+    $c = Read-TrackedPlaylistConfiguration $ConfigPath
+    $dialog=[System.Windows.Forms.Form]@{Text='編輯追蹤播放清單';Size=[System.Drawing.Size]::new(700,490);StartPosition='CenterParent';FormBorderStyle='FixedDialog';MaximizeBox=$false;MinimizeBox=$false;ShowInTaskbar=$false}
+    $layout=[System.Windows.Forms.TableLayoutPanel]@{Dock='Fill';Padding=[System.Windows.Forms.Padding]::new(16);ColumnCount=2;RowCount=9}
+    [void]$layout.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new('Absolute',125));[void]$layout.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new('Percent',100))
+    1..8|ForEach-Object{[void]$layout.RowStyles.Add([System.Windows.Forms.RowStyle]::new('AutoSize'))};[void]$layout.RowStyles.Add([System.Windows.Forms.RowStyle]::new('Percent',100))
+    $labels=@('播放清單名稱','播放清單網址','輸出資料夾','Auth Mode','Cookie 檔案','Browser','品質模式','音訊格式 / 品質')
+    for($i=0;$i-lt $labels.Count;$i++){ $l=[System.Windows.Forms.Label]@{Text=$labels[$i];AutoSize=$true;Anchor='Left';Margin=[System.Windows.Forms.Padding]::new(3,9,8,9)};$layout.Controls.Add($l,0,$i) }
+    $title=[System.Windows.Forms.TextBox]@{Dock='Fill';Text=[string]$c.playlist_title};$layout.Controls.Add($title,1,0)
+    $url=[System.Windows.Forms.TextBox]@{Dock='Fill';Text=[string]$c.playlist_url;ReadOnly=$true;BackColor=[System.Drawing.SystemColors]::Control};$layout.Controls.Add($url,1,1)
+    $folderLineEdit=[System.Windows.Forms.FlowLayoutPanel]@{Dock='Fill';AutoSize=$true;WrapContents=$false};$folder=[System.Windows.Forms.TextBox]@{Width=450;Text=[string]$c.output_folder};$folderBrowse=[System.Windows.Forms.Button]@{Text='選擇…';AutoSize=$true};$folderBrowse.Add_Click({$d=[System.Windows.Forms.FolderBrowserDialog]::new();$d.SelectedPath=$folder.Text;if($d.ShowDialog() -eq 'OK'){$folder.Text=$d.SelectedPath}});$folderLineEdit.Controls.AddRange(@($folder,$folderBrowse));$layout.Controls.Add($folderLineEdit,1,2)
+    $auth=[System.Windows.Forms.ComboBox]@{DropDownStyle='DropDownList';Width=180};[void]$auth.Items.AddRange(@('None','CookieFile','CookieBridge','Browser'));$auth.SelectedItem=[string]$c.auth_mode;$layout.Controls.Add($auth,1,3)
+    $cookie=[System.Windows.Forms.TextBox]@{Dock='Fill';Text=[string]$c.cookie_file_path};$layout.Controls.Add($cookie,1,4)
+    $browser=[System.Windows.Forms.ComboBox]@{DropDownStyle='DropDownList';Width=140};[void]$browser.Items.AddRange(@('chrome','edge','firefox','brave'));if($c.browser){$browser.SelectedItem=([string]$c.browser).ToLowerInvariant()}else{$browser.SelectedIndex=0};$layout.Controls.Add($browser,1,5)
+    $mode=[System.Windows.Forms.ComboBox]@{DropDownStyle='DropDownList';Width=220};[void]$mode.Items.AddRange(@('保留來源最佳品質','重新編碼'));$mode.SelectedItem=[string]$c.quality_mode;$layout.Controls.Add($mode,1,6)
+    $qualityLineEdit=[System.Windows.Forms.FlowLayoutPanel]@{Dock='Fill';AutoSize=$true;WrapContents=$false};$audio=[System.Windows.Forms.ComboBox]@{DropDownStyle='DropDownList';Width=120};[void]$audio.Items.AddRange(@('opus','mp3','m4a','flac','wav'));$audio.SelectedItem=[string]$c.audio_format;$bitrate=[System.Windows.Forms.ComboBox]@{DropDownStyle='DropDownList';Width=130};[void]$bitrate.Items.AddRange(@('0（最佳）','64K','96K','128K','160K','192K','256K','320K'));$bitrate.SelectedItem=[string]$c.transcode_quality;$qualityLineEdit.Controls.AddRange(@($audio,$bitrate));$layout.Controls.Add($qualityLineEdit,1,7)
+    $buttons=[System.Windows.Forms.FlowLayoutPanel]@{Dock='Bottom';AutoSize=$true;FlowDirection='RightToLeft'};$ok=[System.Windows.Forms.Button]@{Text='儲存';DialogResult='OK';AutoSize=$true};$cancel=[System.Windows.Forms.Button]@{Text='取消';DialogResult='Cancel';AutoSize=$true};$buttons.Controls.AddRange(@($cancel,$ok));$layout.Controls.Add($buttons,1,8)
+    $updateEditState={ $cookie.Enabled=$auth.SelectedItem -eq 'CookieFile';$browser.Enabled=$auth.SelectedItem -eq 'Browser';$reencode=$mode.SelectedItem -eq '重新編碼';$audio.Enabled=$reencode;$bitrate.Enabled=$reencode }
+    $auth.Add_SelectedIndexChanged($updateEditState);$mode.Add_SelectedIndexChanged($updateEditState);&$updateEditState
+    $dialog.Controls.Add($layout);$dialog.AcceptButton=$ok;$dialog.CancelButton=$cancel
+    try {
+        if($dialog.ShowDialog($form)-ne 'OK'){return $false}
+        if([string]::IsNullOrWhiteSpace($title.Text)-or[string]::IsNullOrWhiteSpace($url.Text)-or[string]::IsNullOrWhiteSpace($folder.Text)){throw '名稱、網址與輸出資料夾不可為空白。'}
+        $c.playlist_title=$title.Text.Trim();$c.playlist_url=$url.Text.Trim();$c.output_folder=$folder.Text.Trim();$c.auth_mode=[string]$auth.SelectedItem
+        $c.cookie_file_path=$(if($c.auth_mode-eq'CookieFile'){$cookie.Text.Trim()}else{''});$c.browser=$(if($c.auth_mode-eq'Browser'){[string]$browser.SelectedItem}else{''})
+        $c.quality_mode=[string]$mode.SelectedItem;$c.audio_format=[string]$audio.SelectedItem;$c.transcode_quality=[string]$bitrate.SelectedItem
+        Save-TrackedPlaylistConfiguration $c $ConfigPath
+        return $true
+    } finally {$dialog.Dispose()}
+}
+
+function Get-TaskIntervalMinutes {
+    try {
+        $task=Get-ScheduledTask -TaskName 'YoutubeAudioDownloader_PlaylistMonitor' -ErrorAction Stop
+        $value=$task.Triggers[0].Repetition.Interval
+        if(-not $value){return $null}
+        $span=if($value -is [timespan]){$value}else{[System.Xml.XmlConvert]::ToTimeSpan([string]$value)}
+        return [int]$span.TotalMinutes
+    } catch { return $null }
+}
+
+function Refresh-AutomationStatus {
+    $taskScript=Join-Path $AppRoot 'PlaylistMonitorTask.ps1';$shell=Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if(-not(Test-Path -LiteralPath $taskScript -PathType Leaf)){$automationStatusLabel.Text='Task 管理工具不存在';return}
+    try {
+        $result=Invoke-CapturedProcess $shell @('-NoProfile','-ExecutionPolicy','Bypass','-File',$taskScript,'-Status')
+        $values=@{};foreach($line in $result.Stdout){if($line-match '^([^:]+):\s*(.*)$'){$values[$matches[1].Trim()]=$matches[2].Trim()}}
+        $installed=[string]$values['Installed'];$enabled=[string]$values['Enabled'];$interval=Get-TaskIntervalMinutes
+        $autoState=if($installed-ne'Yes'){'未安裝'}elseif($enabled-eq'Yes'){'已啟用'}else{'已停用'}
+        $intervalText=if($null-ne$interval){"每 $interval 分鐘"}else{'—'}
+        if($null-ne$interval -and $intervalBox.Items.Contains("$interval 分鐘")){$intervalBox.SelectedItem="$interval 分鐘"}
+        $lastResult=[string]$values['Last Result']
+        $lastResultText=if($lastResult-eq'0'){'成功'}elseif($lastResult-in@('N/A','Never run','')){$lastResult}else{"失敗（代碼 $lastResult）"}
+        $automationStatusLabel.Text="自動追蹤：$autoState`r`n檢查間隔：$intervalText`r`n上次執行：$($values['Last Run'])    上次結果：$lastResultText`r`n下次執行：$($values['Next Run'])"
+    } catch {$automationStatusLabel.Text="無法讀取排程狀態：$($_.Exception.Message)"}
+}
+
+function Invoke-PlaylistMonitorTaskCommand([string]$Operation, [int]$IntervalMinutes = 0) {
+    $taskScript=Join-Path $AppRoot 'PlaylistMonitorTask.ps1';$shell=Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $Script:GuiLogChannel='Tracker'
+    try {
+        $arguments=@('-NoProfile','-ExecutionPolicy','Bypass','-File',$taskScript,$Operation)
+        if($Operation-eq'-Install'){
+            if($IntervalMinutes-lt 30 -or $IntervalMinutes-gt 1440){throw "檢查間隔超出允許範圍：$IntervalMinutes"}
+            $arguments+=@('-IntervalMinutes',[string]$IntervalMinutes)
+        }
+        $result=Invoke-CapturedProcess $shell $arguments
+        foreach($line in $result.Stdout){Write-Log $line};foreach($line in $result.Stderr){Write-Log "[Task Error] $line"}
+        if($result.ExitCode-ne 0){Write-Log "[Task] 操作失敗，exit code $($result.ExitCode)"}
+    } catch {Write-Log "[Task] 操作失敗：$($_.Exception.Message)"} finally {Refresh-AutomationStatus}
+}
+
 $downloadTimer = [System.Windows.Forms.Timer]::new()
 $downloadTimer.Interval = 100
 $downloadTimer.Add_Tick({
@@ -1972,15 +2256,23 @@ $downloadTimer.Add_Tick({
     try { Update-DownloadSession }
     finally { $Script:DownloadTimerBusy = $false }
 })
-$probeButton.Add_Click({ Check-Formats })
-$startButton.Add_Click({ Start-Download })
+$probeButton.Add_Click({ $Script:GuiLogChannel='Download'; Check-Formats })
+$startButton.Add_Click({ $Script:GuiLogChannel='Download'; Start-Download })
 $cancelButton.Add_Click({ Show-DownloadControlDialog })
 $openButton.Add_Click({ New-Item -ItemType Directory -Force -Path $folderBox.Text | Out-Null; Start-Process explorer.exe $folderBox.Text })
-$updateButton.Add_Click({ Update-YtDlp })
-$trackAddButton.Add_Click({ Add-TrackedPlaylist })
-$trackCheckButton.Add_Click({ Start-TrackedPlaylistBatch })
-$trackListButton.Add_Click({ Show-TrackedPlaylistList })
-$buttonLine.Controls.AddRange(@($startButton,$cancelButton,$openButton,$updateButton,$trackCheckButton,$trackAddButton,$trackListButton)); $panel.Controls.Add($buttonLine,1,9)
+$updateButton.Add_Click({ $Script:GuiLogChannel='Download'; Update-YtDlp })
+$trackAddButton.Add_Click({$playlistUrl=Show-TrackerUrlDialog;if($playlistUrl){$Script:GuiLogChannel='Tracker';Add-TrackedPlaylist $playlistUrl}})
+$trackEditButton.Add_Click({$path=Get-SelectedTrackerPath;if(-not $path){[System.Windows.Forms.MessageBox]::Show('請先選擇一個播放清單。','播放清單追蹤','OK','Information')|Out-Null;return};try{if(Show-TrackerEditDialog $path){$Script:GuiLogChannel='Tracker';Write-Log '[Tracker] 設定已更新。';Refresh-TrackedPlaylistGrid}}catch{[System.Windows.Forms.MessageBox]::Show($_.Exception.Message,'編輯失敗','OK','Error')|Out-Null}})
+$trackToggleButton.Add_Click({$path=Get-SelectedTrackerPath;if(-not $path){[System.Windows.Forms.MessageBox]::Show('請先選擇一個播放清單。','播放清單追蹤','OK','Information')|Out-Null;return};try{$c=Read-TrackedPlaylistConfiguration $path;$c.enabled=-not[bool]$c.enabled;Save-TrackedPlaylistConfiguration $c $path;$Script:GuiLogChannel='Tracker';Write-Log "[Tracker] $($c.playlist_title)：$(if($c.enabled){'已啟用'}else{'已停用'})";Refresh-TrackedPlaylistGrid}catch{[System.Windows.Forms.MessageBox]::Show($_.Exception.Message,'更新失敗','OK','Error')|Out-Null}})
+$trackRemoveButton.Add_Click({$path=Get-SelectedTrackerPath;if(-not $path){[System.Windows.Forms.MessageBox]::Show('請先選擇一個播放清單。','播放清單追蹤','OK','Information')|Out-Null;return};try{$c=Read-TrackedPlaylistConfiguration $path;$choice=[System.Windows.Forms.MessageBox]::Show("只移除追蹤設定「$($c.playlist_title)」嗎？`r`n已下載音訊與 archive 都會保留。",'確認移除','YesNo','Warning');if($choice-eq'Yes'){Remove-Item -LiteralPath $path -Force;$Script:GuiLogChannel='Tracker';Write-Log "[Tracker] 已移除設定：$($c.playlist_title)；archive 與音訊均保留。";Refresh-TrackedPlaylistGrid}}catch{[System.Windows.Forms.MessageBox]::Show($_.Exception.Message,'移除失敗','OK','Error')|Out-Null}})
+$trackSelectedButton.Add_Click({$path=Get-SelectedTrackerPath;if(-not $path){[System.Windows.Forms.MessageBox]::Show('請先選擇一個播放清單。','播放清單追蹤','OK','Information')|Out-Null;return};$Script:GuiLogChannel='Tracker';$trackSelectedButton.Enabled=$false;Start-TrackedPlaylistBatch @($path);if(-not $Script:TrackerBatchActive){$trackSelectedButton.Enabled=$true}})
+$trackCheckButton.Add_Click({$Script:GuiLogChannel='Tracker';$trackSelectedButton.Enabled=$false;Start-TrackedPlaylistBatch;if(-not $Script:TrackerBatchActive){$trackSelectedButton.Enabled=$true}})
+$taskApplyButton.Add_Click({$minutes=[int]([regex]::Match([string]$intervalBox.SelectedItem,'\d+').Value);Invoke-PlaylistMonitorTaskCommand '-Install' $minutes})
+$taskRemoveButton.Add_Click({Invoke-PlaylistMonitorTaskCommand '-Remove'})
+$taskRunNowButton.Add_Click({Invoke-PlaylistMonitorTaskCommand '-RunNow'})
+$tabControl.Add_SelectedIndexChanged({if($tabControl.SelectedTab-eq$trackerTab){Refresh-TrackedPlaylistGrid;Refresh-AutomationStatus}})
 
 Write-Log '就緒。保留來源最佳品質時，依序優先使用 774 → 141 → 251；只有「重新編碼」模式才會套用音訊格式與轉碼品質設定。'
+Refresh-TrackedPlaylistGrid
+Refresh-AutomationStatus
 if ($env:YAD_TEST_NO_SHOW -ne '1') { [void]$form.ShowDialog() }
