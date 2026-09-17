@@ -1,5 +1,10 @@
-# Local dependencies and downloaded media
-/tools/*
+# Authentication and browser session data
+/data/auth/
+[Cc]ookies*.txt
+*.[Cc]ookies.txt
+youtube.cookies.txt
+
+# Downloads and media output
 /downloads/
 *.opus
 *.webm
@@ -10,19 +15,29 @@
 *.part
 *.ytdl
 
-# Authentication files: never commit browser sessions
-/data/auth/
+# Runtime playlist state
 /data/tracked-playlists/
-*cookie*
-*Cookie*
-*.txt
 
-# Runtime logs and temporary files
+# Runtime logs
+/logs/
 *.log
-*.tmp
-*.zip
 
-# Keep the Cookie Bridge source, but never its compiled output or credentials.
-!/tools/cookie-bridge/
-!/tools/cookie-bridge/**
+# Cookie Bridge build output
 /tools/cookie-bridge/dist/
+/tools/cookie-bridge/bin/
+/tools/cookie-bridge/obj/
+*.pdb
+
+# Third-party downloaded tools and provider runtime
+/tools/yt-dlp.exe
+/tools/yt-dlp-nightly.exe
+/tools/ffmpeg.exe
+/tools/ffprobe.exe
+/tools/deno.exe
+/tools/yt-dlp-plugins/
+/tools/po-token-provider/
+
+# Temporary and downloaded package files
+*.tmp
+*.bak
+*.zip

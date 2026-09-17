@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "playlist_id": "PL_EXAMPLE_PUBLIC_PLAYLIST_ID",
+  "playlist_url": "https://www.youtube.com/playlist?list=PL_EXAMPLE_PUBLIC_PLAYLIST_ID",
+  "playlist_title": "Example tracked playlist",
+  "enabled": true,
+  "output_folder": "C:\\Music\\YouTube",
+  "auth_mode": "CookieBridge",
+  "cookie_file_path": "",
+  "browser": "",
+  "quality_mode": "保留來源最佳品質",
+  "audio_format": "opus",
+  "transcode_quality": "0（最佳）",
+  "created_at": "2026-01-01T00:00:00.0000000Z",
+  "last_checked_at": null,
+  "last_success_at": null
+}

@@ -9,8 +9,12 @@ param(
     [switch]$Remove,
     [switch]$Status,
     [switch]$RunNow,
+    [ValidateSet('Interval', 'Daily', 'Weekly')]
+    [string]$Mode = 'Interval',
     [ValidateRange(30, 1440)]
-    [int]$IntervalMinutes = 60
+    [int]$IntervalMinutes = 60,
+    [string]$Time = '',
+    [string[]]$Days = @()
 )
 
 $ErrorActionPreference = 'Stop'
@@ -32,21 +36,108 @@ function Format-TaskDate($Value) {
     return ([datetime]$Value).ToString('yyyy-MM-dd HH:mm:ss')
 }
 
+function ConvertTo-ScheduleTime([string]$Value) {
+    if ([string]::IsNullOrWhiteSpace($Value) -or $Value -notmatch '^(?:[01]\d|2[0-3]):[0-5]\d$') {
+        throw '-Time 必須使用有效的 24 小時 HH:mm 格式，例如 08:30 或 20:00。'
+    }
+    $parsed = [datetime]::MinValue
+    if (-not [datetime]::TryParseExact($Value, 'HH:mm', [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$parsed)) {
+        throw "無效的執行時間：$Value"
+    }
+    return (Get-Date).Date.Add($parsed.TimeOfDay)
+}
+
+function ConvertTo-ScheduleDays([string[]]$Values) {
+    $allowed = @('Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday')
+    $result = [System.Collections.Generic.List[System.DayOfWeek]]::new()
+    foreach ($value in @($Values)) {
+        foreach ($part in @([string]$value -split ',')) {
+            $name = $part.Trim()
+            if ([string]::IsNullOrWhiteSpace($name)) { continue }
+            $canonical = @($allowed | Where-Object { $_ -ieq $name } | Select-Object -First 1)
+            if ($canonical.Count -eq 0) {
+                throw "無效的星期：$name。允許 Monday 至 Sunday。"
+            }
+            $day = [System.Enum]::Parse([System.DayOfWeek], [string]$canonical[0], $true)
+            if (-not $result.Contains($day)) { $result.Add($day) }
+        }
+    }
+    if ($result.Count -eq 0) { throw 'Weekly mode 至少必須透過 -Days 指定一天。' }
+    return $result.ToArray()
+}
+
+function Get-TriggerStartTime($Trigger) {
+    try { return ([datetime]::Parse([string]$Trigger.StartBoundary)).ToString('HH:mm') }
+    catch { return '' }
+}
+
+function Get-WeeklyTriggerDays($Trigger) {
+    $mask = [int]$Trigger.DaysOfWeek
+    $mapping = [ordered]@{
+        Sunday = 1; Monday = 2; Tuesday = 4; Wednesday = 8
+        Thursday = 16; Friday = 32; Saturday = 64
+    }
+    return @($mapping.Keys | Where-Object { ($mask -band $mapping[$_]) -ne 0 })
+}
+
+function Get-TaskScheduleInfo($Task) {
+    $trigger = $Task.Triggers | Select-Object -First 1
+    if (-not $trigger) {
+        return [pscustomobject]@{ Mode='Unknown'; Description='Unknown'; IntervalMinutes=''; Time=''; Days=@() }
+    }
+    $className = [string]$trigger.CimClass.CimClassName
+    if ($className -match 'WeeklyTrigger') {
+        $time = Get-TriggerStartTime $trigger
+        $days = @(Get-WeeklyTriggerDays $trigger)
+        return [pscustomobject]@{
+            Mode='Weekly'; Description="$(($days -join ', ')) at $time"; IntervalMinutes=''; Time=$time; Days=$days
+        }
+    }
+    if ($className -match 'DailyTrigger') {
+        $time = Get-TriggerStartTime $trigger
+        return [pscustomobject]@{
+            Mode='Daily'; Description="Every day at $time"; IntervalMinutes=''; Time=$time; Days=@()
+        }
+    }
+    $intervalValue = $trigger.Repetition.Interval
+    if ($intervalValue) {
+        try {
+            $span = if ($intervalValue -is [timespan]) { $intervalValue } else { [System.Xml.XmlConvert]::ToTimeSpan([string]$intervalValue) }
+            $minutes = [int]$span.TotalMinutes
+            return [pscustomobject]@{
+                Mode='Interval'; Description="Every $minutes minutes"; IntervalMinutes=$minutes; Time=''; Days=@()
+            }
+        } catch { }
+    }
+    return [pscustomobject]@{ Mode='Unknown'; Description='Unknown'; IntervalMinutes=''; Time=''; Days=@() }
+}
+
 function Show-PlaylistMonitorTaskStatus {
     $task = Get-PlaylistMonitorTask
     Write-TaskLine "Task: $TaskName"
     if (-not $task) {
         Write-TaskLine 'Installed: No'
         Write-TaskLine 'Enabled: No'
+        Write-TaskLine 'Schedule Mode: N/A'
+        Write-TaskLine 'Schedule: N/A'
+        Write-TaskLine 'Schedule Interval Minutes: N/A'
+        Write-TaskLine 'Schedule Time: N/A'
+        Write-TaskLine 'Schedule Days: N/A'
         Write-TaskLine 'Last Run: Never'
         Write-TaskLine 'Last Result: N/A'
         Write-TaskLine 'Next Run: Never'
         return
     }
     $info = Get-ScheduledTaskInfo -TaskName $TaskName
+    $schedule = Get-TaskScheduleInfo $task
     $neverRun = ($info.LastTaskResult -eq 267011 -or $info.LastRunTime.Year -lt 2000)
     Write-TaskLine 'Installed: Yes'
     Write-TaskLine ("Enabled: " + $(if ($task.State -eq 'Disabled') { 'No' } else { 'Yes' }))
+    Write-TaskLine "Schedule Mode: $($schedule.Mode)"
+    Write-TaskLine "Schedule: $($schedule.Description)"
+    Write-TaskLine "Schedule Interval Minutes: $(if ($schedule.IntervalMinutes) { $schedule.IntervalMinutes } else { 'N/A' })"
+    Write-TaskLine "Schedule Time: $(if ($schedule.Time) { $schedule.Time } else { 'N/A' })"
+    Write-TaskLine "Schedule Days: $(if ($schedule.Days.Count) { $schedule.Days -join ',' } else { 'N/A' })"
     Write-TaskLine ("Last Run: " + $(if ($neverRun) { 'Never' } else { Format-TaskDate $info.LastRunTime }))
     Write-TaskLine ("Last Result: " + $(if ($neverRun) { 'Never run' } else { [string]$info.LastTaskResult }))
     Write-TaskLine "Next Run: $(Format-TaskDate $info.NextRunTime)"
@@ -69,8 +160,25 @@ function Install-PlaylistMonitorTask {
 
     $actionArguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -CheckAll' -f $absoluteMonitorPath.Replace('"', '\"')
     $action = New-ScheduledTaskAction -Execute $WindowsPowerShell -Argument $actionArguments
-    $firstRun = (Get-Date).AddMinutes($IntervalMinutes)
-    $trigger = New-ScheduledTaskTrigger -Once -At $firstRun -RepetitionInterval (New-TimeSpan -Minutes $IntervalMinutes)
+    $scheduleDescription = ''
+    switch ($Mode) {
+        'Interval' {
+            $firstRun = (Get-Date).AddMinutes($IntervalMinutes)
+            $trigger = New-ScheduledTaskTrigger -Once -At $firstRun -RepetitionInterval (New-TimeSpan -Minutes $IntervalMinutes)
+            $scheduleDescription = "Every $IntervalMinutes minutes"
+        }
+        'Daily' {
+            $at = ConvertTo-ScheduleTime $Time
+            $trigger = New-ScheduledTaskTrigger -Daily -At $at
+            $scheduleDescription = "Every day at $($at.ToString('HH:mm'))"
+        }
+        'Weekly' {
+            $at = ConvertTo-ScheduleTime $Time
+            $validatedDays = @(ConvertTo-ScheduleDays $Days)
+            $trigger = New-ScheduledTaskTrigger -Weekly -WeeksInterval 1 -DaysOfWeek $validatedDays -At $at
+            $scheduleDescription = "$($validatedDays -join ', ') at $($at.ToString('HH:mm'))"
+        }
+    }
     $principal = New-ScheduledTaskPrincipal -UserId $currentAccount -LogonType Interactive -RunLevel Limited
     $settings = New-ScheduledTaskSettingsSet `
         -MultipleInstances IgnoreNew `
@@ -84,7 +192,8 @@ function Install-PlaylistMonitorTask {
     Write-TaskLine '[Task] Installed successfully'
     Write-TaskLine "[Task] Account: $currentAccount"
     Write-TaskLine '[Task] Logon mode: Interactive (only while the user is logged on)'
-    Write-TaskLine "[Task] Interval: $IntervalMinutes minute(s)"
+    Write-TaskLine "[Task] Schedule mode: $Mode"
+    Write-TaskLine "[Task] Schedule: $scheduleDescription"
     Write-TaskLine "[Task] Action: $WindowsPowerShell $actionArguments"
 }
 

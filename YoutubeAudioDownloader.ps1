@@ -2101,23 +2101,52 @@ $trackerButtonLine.Controls.AddRange(@($trackAddButton,$trackEditButton,$trackTo
 $trackerPanel.Controls.Add($trackerButtonLine,0,1)
 
 $automationGroup = [System.Windows.Forms.GroupBox]@{ Text='自動追蹤'; Dock='Fill'; AutoSize=$true; Padding=[System.Windows.Forms.Padding]::new(10); Margin=[System.Windows.Forms.Padding]::new(3,0,3,8) }
-$automationLayout = [System.Windows.Forms.TableLayoutPanel]@{ Dock='Fill'; AutoSize=$true; ColumnCount=1; RowCount=3 }
+$automationLayout = [System.Windows.Forms.TableLayoutPanel]@{ Dock='Fill'; AutoSize=$true; ColumnCount=1; RowCount=4 }
 [void]$automationLayout.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Percent,100))
 [void]$automationLayout.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::AutoSize))
 [void]$automationLayout.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::AutoSize))
 [void]$automationLayout.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::AutoSize))
+[void]$automationLayout.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::AutoSize))
 $automationStatusLabel = [System.Windows.Forms.Label]@{ Text='正在讀取排程狀態…'; AutoSize=$true; Anchor='Left'; Margin=[System.Windows.Forms.Padding]::new(3,3,3,7) }
-$automationControls = [System.Windows.Forms.FlowLayoutPanel]@{ Dock='Fill'; AutoSize=$true; WrapContents=$false; Margin=[System.Windows.Forms.Padding]::new(0,0,0,5) }
+$automationControls = [System.Windows.Forms.FlowLayoutPanel]@{ Dock='Fill'; AutoSize=$true; WrapContents=$false; Margin=[System.Windows.Forms.Padding]::new(0,0,0,3) }
+$scheduleModeLabel = [System.Windows.Forms.Label]@{ Text='排程模式：'; AutoSize=$true; Margin=[System.Windows.Forms.Padding]::new(3,8,3,3) }
+$scheduleModeBox = [System.Windows.Forms.ComboBox]@{ DropDownStyle='DropDownList'; Width=150; Margin=[System.Windows.Forms.Padding]::new(0,4,12,3) }
+[void]$scheduleModeBox.Items.AddRange(@('固定間隔','每日固定時間','每週指定時間'))
+$scheduleModeBox.SelectedItem='固定間隔'
+$taskApplyButton = [System.Windows.Forms.Button]@{ Text='套用排程'; AutoSize=$true }
+$taskRemoveButton = [System.Windows.Forms.Button]@{ Text='停用自動追蹤'; AutoSize=$true }
+$taskRunNowButton = [System.Windows.Forms.Button]@{ Text='立即執行'; AutoSize=$true }
+$automationControls.Controls.AddRange(@($scheduleModeLabel,$scheduleModeBox,$taskApplyButton,$taskRemoveButton,$taskRunNowButton))
+
+$scheduleSettingsHost = [System.Windows.Forms.FlowLayoutPanel]@{ Dock='Fill'; AutoSize=$true; WrapContents=$false; Margin=[System.Windows.Forms.Padding]::new(0,0,0,5) }
+$intervalSettingsPanel = [System.Windows.Forms.FlowLayoutPanel]@{ AutoSize=$true; WrapContents=$false; Margin=[System.Windows.Forms.Padding]::new(0) }
 $intervalLabel = [System.Windows.Forms.Label]@{ Text='檢查間隔：'; AutoSize=$true; Margin=[System.Windows.Forms.Padding]::new(3,8,3,3) }
 $intervalBox = [System.Windows.Forms.ComboBox]@{ DropDownStyle='DropDownList'; Width=120; Margin=[System.Windows.Forms.Padding]::new(0,4,12,3) }
 [void]$intervalBox.Items.AddRange(@('30 分鐘','60 分鐘','120 分鐘','180 分鐘','360 分鐘','720 分鐘','1440 分鐘'))
 $intervalBox.SelectedItem='60 分鐘'
-$taskApplyButton = [System.Windows.Forms.Button]@{ Text='套用排程'; AutoSize=$true }
-$taskRemoveButton = [System.Windows.Forms.Button]@{ Text='停用自動追蹤'; AutoSize=$true }
-$taskRunNowButton = [System.Windows.Forms.Button]@{ Text='立即執行'; AutoSize=$true }
-$automationControls.Controls.AddRange(@($intervalLabel,$intervalBox,$taskApplyButton,$taskRemoveButton,$taskRunNowButton))
+$intervalSettingsPanel.Controls.AddRange(@($intervalLabel,$intervalBox))
+
+$dailySettingsPanel = [System.Windows.Forms.FlowLayoutPanel]@{ AutoSize=$true; WrapContents=$false; Margin=[System.Windows.Forms.Padding]::new(0) }
+$dailyTimeLabel = [System.Windows.Forms.Label]@{ Text='執行時間：'; AutoSize=$true; Margin=[System.Windows.Forms.Padding]::new(3,8,3,3) }
+$dailyTimeBox = [System.Windows.Forms.MaskedTextBox]@{ Mask='00:00'; Width=65; Text='2000'; Margin=[System.Windows.Forms.Padding]::new(0,4,3,3) }
+$dailySettingsPanel.Controls.AddRange(@($dailyTimeLabel,$dailyTimeBox))
+
+$weeklySettingsPanel = [System.Windows.Forms.FlowLayoutPanel]@{ AutoSize=$true; WrapContents=$false; Margin=[System.Windows.Forms.Padding]::new(0) }
+$weeklyDaysLabel = [System.Windows.Forms.Label]@{ Text='星期：'; AutoSize=$true; Margin=[System.Windows.Forms.Padding]::new(3,8,3,3) }
+$weekdayDefinitions = @(
+    @{ Text='一'; Day='Monday' }, @{ Text='二'; Day='Tuesday' }, @{ Text='三'; Day='Wednesday' },
+    @{ Text='四'; Day='Thursday' }, @{ Text='五'; Day='Friday' }, @{ Text='六'; Day='Saturday' }, @{ Text='日'; Day='Sunday' }
+)
+$weekdayChecks = [ordered]@{}
+$weeklySettingsPanel.Controls.Add($weeklyDaysLabel)
+foreach($definition in $weekdayDefinitions){$check=[System.Windows.Forms.CheckBox]@{Text=$definition.Text;AutoSize=$true;Margin=[System.Windows.Forms.Padding]::new(2,6,2,3);Tag=$definition.Day};$weekdayChecks[$definition.Day]=$check;$weeklySettingsPanel.Controls.Add($check)}
+$weeklyTimeLabel = [System.Windows.Forms.Label]@{ Text='時間：'; AutoSize=$true; Margin=[System.Windows.Forms.Padding]::new(12,8,3,3) }
+$weeklyTimeBox = [System.Windows.Forms.MaskedTextBox]@{ Mask='00:00'; Width=65; Text='2000'; Margin=[System.Windows.Forms.Padding]::new(0,4,3,3) }
+$weeklySettingsPanel.Controls.AddRange(@($weeklyTimeLabel,$weeklyTimeBox))
+$scheduleSettingsHost.Controls.AddRange(@($intervalSettingsPanel,$dailySettingsPanel,$weeklySettingsPanel))
+
 $automationHint = [System.Windows.Forms.Label]@{ Text="「啟用播放清單」決定 Monitor 執行時是否檢查該清單；「自動追蹤」決定 Windows 是否定時啟動 Monitor。"; AutoSize=$true; ForeColor=[System.Drawing.Color]::DimGray; Margin=[System.Windows.Forms.Padding]::new(3,0,3,3) }
-$automationLayout.Controls.Add($automationStatusLabel,0,0); $automationLayout.Controls.Add($automationControls,0,1); $automationLayout.Controls.Add($automationHint,0,2)
+$automationLayout.Controls.Add($automationStatusLabel,0,0); $automationLayout.Controls.Add($automationControls,0,1); $automationLayout.Controls.Add($scheduleSettingsHost,0,2); $automationLayout.Controls.Add($automationHint,0,3)
 $automationGroup.Controls.Add($automationLayout); $trackerPanel.Controls.Add($automationGroup,0,2)
 
 $trackerLogGroup = [System.Windows.Forms.GroupBox]@{ Text='Tracker / Monitor 執行紀錄'; Dock='Fill'; Padding=[System.Windows.Forms.Padding]::new(8) }
@@ -2207,14 +2236,19 @@ function Show-TrackerEditDialog([string]$ConfigPath) {
     } finally {$dialog.Dispose()}
 }
 
-function Get-TaskIntervalMinutes {
-    try {
-        $task=Get-ScheduledTask -TaskName 'YoutubeAudioDownloader_PlaylistMonitor' -ErrorAction Stop
-        $value=$task.Triggers[0].Repetition.Interval
-        if(-not $value){return $null}
-        $span=if($value -is [timespan]){$value}else{[System.Xml.XmlConvert]::ToTimeSpan([string]$value)}
-        return [int]$span.TotalMinutes
-    } catch { return $null }
+function Update-ScheduleModeControls {
+    $intervalSettingsPanel.Visible=$scheduleModeBox.SelectedItem-eq'固定間隔'
+    $dailySettingsPanel.Visible=$scheduleModeBox.SelectedItem-eq'每日固定時間'
+    $weeklySettingsPanel.Visible=$scheduleModeBox.SelectedItem-eq'每週指定時間'
+}
+
+function Test-ScheduleTimeInput([string]$Value) {
+    if($Value-notmatch'^(?:[01]\d|2[0-3]):[0-5]\d$'){throw '執行時間必須是有效的 24 小時 HH:mm，例如 08:30 或 20:00。'}
+    return $Value
+}
+
+function Get-SelectedScheduleDays {
+    return @($weekdayChecks.Keys|Where-Object{$weekdayChecks[$_].Checked})
 }
 
 function Refresh-AutomationStatus {
@@ -2223,29 +2257,74 @@ function Refresh-AutomationStatus {
     try {
         $result=Invoke-CapturedProcess $shell @('-NoProfile','-ExecutionPolicy','Bypass','-File',$taskScript,'-Status')
         $values=@{};foreach($line in $result.Stdout){if($line-match '^([^:]+):\s*(.*)$'){$values[$matches[1].Trim()]=$matches[2].Trim()}}
-        $installed=[string]$values['Installed'];$enabled=[string]$values['Enabled'];$interval=Get-TaskIntervalMinutes
+        $installed=[string]$values['Installed'];$enabled=[string]$values['Enabled'];$mode=[string]$values['Schedule Mode']
         $autoState=if($installed-ne'Yes'){'未安裝'}elseif($enabled-eq'Yes'){'已啟用'}else{'已停用'}
-        $intervalText=if($null-ne$interval){"每 $interval 分鐘"}else{'—'}
-        if($null-ne$interval -and $intervalBox.Items.Contains("$interval 分鐘")){$intervalBox.SelectedItem="$interval 分鐘"}
+        $scheduleText='—';$modeText='—'
+        if($installed-eq'Yes'){
+            switch($mode){
+                'Interval'{
+                    $modeText='固定間隔';$scheduleModeBox.SelectedItem='固定間隔';$interval=[string]$values['Schedule Interval Minutes']
+                    if($intervalBox.Items.Contains("$interval 分鐘")){$intervalBox.SelectedItem="$interval 分鐘"}
+                    $scheduleText="每 $interval 分鐘"
+                }
+                'Daily'{
+                    $modeText='每日固定時間';$scheduleModeBox.SelectedItem='每日固定時間';$time=[string]$values['Schedule Time']
+                    if($time-match'^\d{2}:\d{2}$'){$dailyTimeBox.Text=$time.Replace(':','')};$scheduleText="每天 $time"
+                }
+                'Weekly'{
+                    $modeText='每週指定時間';$scheduleModeBox.SelectedItem='每週指定時間';$time=[string]$values['Schedule Time']
+                    if($time-match'^\d{2}:\d{2}$'){$weeklyTimeBox.Text=$time.Replace(':','')}
+                    foreach($key in $weekdayChecks.Keys){$weekdayChecks[$key].Checked=$false}
+                    $selectedDays=@(([string]$values['Schedule Days'])-split','|Where-Object{-not[string]::IsNullOrWhiteSpace($_)})
+                    foreach($day in $selectedDays){$name=$day.Trim();if($weekdayChecks.Contains($name)){$weekdayChecks[$name].Checked=$true}}
+                    $dayNames=@($selectedDays|ForEach-Object{switch($_.Trim()){'Monday'{'一'}'Tuesday'{'二'}'Wednesday'{'三'}'Thursday'{'四'}'Friday'{'五'}'Saturday'{'六'}'Sunday'{'日'}}})
+                    $scheduleText="每週 $($dayNames-join'、') $time"
+                }
+                default{$modeText='未知';$scheduleText=[string]$values['Schedule']}
+            }
+        }
+        Update-ScheduleModeControls
         $lastResult=[string]$values['Last Result']
-        $lastResultText=if($lastResult-eq'0'){'成功'}elseif($lastResult-in@('N/A','Never run','')){$lastResult}else{"失敗（代碼 $lastResult）"}
-        $automationStatusLabel.Text="自動追蹤：$autoState`r`n檢查間隔：$intervalText`r`n上次執行：$($values['Last Run'])    上次結果：$lastResultText`r`n下次執行：$($values['Next Run'])"
+        $lastResultText=if($lastResult-eq'0'){'成功'}elseif($lastResult-eq'267009'){'執行中'}elseif($lastResult-in@('N/A','Never run','')){'尚未執行'}else{"失敗（代碼 $lastResult）"}
+        $automationStatusLabel.Text="自動追蹤：$autoState`r`n排程模式：$modeText    排程：$scheduleText`r`n上次執行：$($values['Last Run'])    上次結果：$lastResultText`r`n下次執行：$($values['Next Run'])"
     } catch {$automationStatusLabel.Text="無法讀取排程狀態：$($_.Exception.Message)"}
 }
 
-function Invoke-PlaylistMonitorTaskCommand([string]$Operation, [int]$IntervalMinutes = 0) {
+function Invoke-PlaylistMonitorTaskCommand {
+    param(
+        [string]$Operation,
+        [ValidateSet('Interval','Daily','Weekly')][string]$Mode='Interval',
+        [int]$IntervalMinutes=60,
+        [string]$ScheduleTime='',
+        [string[]]$Days=@()
+    )
     $taskScript=Join-Path $AppRoot 'PlaylistMonitorTask.ps1';$shell=Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $Script:GuiLogChannel='Tracker'
     try {
         $arguments=@('-NoProfile','-ExecutionPolicy','Bypass','-File',$taskScript,$Operation)
         if($Operation-eq'-Install'){
-            if($IntervalMinutes-lt 30 -or $IntervalMinutes-gt 1440){throw "檢查間隔超出允許範圍：$IntervalMinutes"}
-            $arguments+=@('-IntervalMinutes',[string]$IntervalMinutes)
+            $arguments+=@('-Mode',$Mode)
+            switch($Mode){
+                'Interval'{if($IntervalMinutes-lt 30-or$IntervalMinutes-gt 1440){throw "檢查間隔超出允許範圍：$IntervalMinutes"};$arguments+=@('-IntervalMinutes',[string]$IntervalMinutes)}
+                'Daily'{$arguments+=@('-Time',(Test-ScheduleTimeInput $ScheduleTime))}
+                'Weekly'{if($Days.Count-eq 0){throw '每週排程至少必須選擇一天。'};$arguments+=@('-Days');$arguments+=@($Days);$arguments+=@('-Time',(Test-ScheduleTimeInput $ScheduleTime))}
+            }
         }
         $result=Invoke-CapturedProcess $shell $arguments
         foreach($line in $result.Stdout){Write-Log $line};foreach($line in $result.Stderr){Write-Log "[Task Error] $line"}
         if($result.ExitCode-ne 0){Write-Log "[Task] 操作失敗，exit code $($result.ExitCode)"}
     } catch {Write-Log "[Task] 操作失敗：$($_.Exception.Message)"} finally {Refresh-AutomationStatus}
+}
+
+function Apply-ScheduleFromGui {
+    try {
+        switch([string]$scheduleModeBox.SelectedItem){
+            '固定間隔'{$minutes=[int]([regex]::Match([string]$intervalBox.SelectedItem,'\d+').Value);Invoke-PlaylistMonitorTaskCommand -Operation '-Install' -Mode Interval -IntervalMinutes $minutes}
+            '每日固定時間'{Invoke-PlaylistMonitorTaskCommand -Operation '-Install' -Mode Daily -ScheduleTime (Test-ScheduleTimeInput $dailyTimeBox.Text)}
+            '每週指定時間'{$days=@(Get-SelectedScheduleDays);if($days.Count-eq 0){throw '每週排程至少必須選擇一天。'};Invoke-PlaylistMonitorTaskCommand -Operation '-Install' -Mode Weekly -Days $days -ScheduleTime (Test-ScheduleTimeInput $weeklyTimeBox.Text)}
+            default{throw '請選擇排程模式。'}
+        }
+    }catch{$Script:GuiLogChannel='Tracker';Write-Log "[Task] 排程設定錯誤：$($_.Exception.Message)";[System.Windows.Forms.MessageBox]::Show($_.Exception.Message,'排程設定錯誤','OK','Warning')|Out-Null}
 }
 
 $downloadTimer = [System.Windows.Forms.Timer]::new()
@@ -2267,12 +2346,14 @@ $trackToggleButton.Add_Click({$path=Get-SelectedTrackerPath;if(-not $path){[Syst
 $trackRemoveButton.Add_Click({$path=Get-SelectedTrackerPath;if(-not $path){[System.Windows.Forms.MessageBox]::Show('請先選擇一個播放清單。','播放清單追蹤','OK','Information')|Out-Null;return};try{$c=Read-TrackedPlaylistConfiguration $path;$choice=[System.Windows.Forms.MessageBox]::Show("只移除追蹤設定「$($c.playlist_title)」嗎？`r`n已下載音訊與 archive 都會保留。",'確認移除','YesNo','Warning');if($choice-eq'Yes'){Remove-Item -LiteralPath $path -Force;$Script:GuiLogChannel='Tracker';Write-Log "[Tracker] 已移除設定：$($c.playlist_title)；archive 與音訊均保留。";Refresh-TrackedPlaylistGrid}}catch{[System.Windows.Forms.MessageBox]::Show($_.Exception.Message,'移除失敗','OK','Error')|Out-Null}})
 $trackSelectedButton.Add_Click({$path=Get-SelectedTrackerPath;if(-not $path){[System.Windows.Forms.MessageBox]::Show('請先選擇一個播放清單。','播放清單追蹤','OK','Information')|Out-Null;return};$Script:GuiLogChannel='Tracker';$trackSelectedButton.Enabled=$false;Start-TrackedPlaylistBatch @($path);if(-not $Script:TrackerBatchActive){$trackSelectedButton.Enabled=$true}})
 $trackCheckButton.Add_Click({$Script:GuiLogChannel='Tracker';$trackSelectedButton.Enabled=$false;Start-TrackedPlaylistBatch;if(-not $Script:TrackerBatchActive){$trackSelectedButton.Enabled=$true}})
-$taskApplyButton.Add_Click({$minutes=[int]([regex]::Match([string]$intervalBox.SelectedItem,'\d+').Value);Invoke-PlaylistMonitorTaskCommand '-Install' $minutes})
+$scheduleModeBox.Add_SelectedIndexChanged({Update-ScheduleModeControls})
+$taskApplyButton.Add_Click({Apply-ScheduleFromGui})
 $taskRemoveButton.Add_Click({Invoke-PlaylistMonitorTaskCommand '-Remove'})
 $taskRunNowButton.Add_Click({Invoke-PlaylistMonitorTaskCommand '-RunNow'})
 $tabControl.Add_SelectedIndexChanged({if($tabControl.SelectedTab-eq$trackerTab){Refresh-TrackedPlaylistGrid;Refresh-AutomationStatus}})
 
 Write-Log '就緒。保留來源最佳品質時，依序優先使用 774 → 141 → 251；只有「重新編碼」模式才會套用音訊格式與轉碼品質設定。'
+Update-ScheduleModeControls
 Refresh-TrackedPlaylistGrid
 Refresh-AutomationStatus
 if ($env:YAD_TEST_NO_SHOW -ne '1') { [void]$form.ShowDialog() }

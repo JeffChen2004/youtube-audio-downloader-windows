@@ -3,7 +3,7 @@ param(
     [Parameter(Mandatory=$true)][string]$CookiePath
 )
 $ErrorActionPreference = 'Stop'
-$root = $PSScriptRoot
+$root = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 # Load existing process/provider helpers without constructing the GUI.
 $source = Get-Content -LiteralPath (Join-Path $root 'YoutubeAudioDownloader.ps1') -Raw
 Invoke-Expression $source.Substring(0, $source.IndexOf('$form = [System.Windows.Forms.Form]'))
