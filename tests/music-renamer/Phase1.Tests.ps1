@@ -44,7 +44,7 @@ try {
     Assert-True ($nonzero.error.code -eq 'adapter_nonzero_exit') 'nonzero exit must fail closed'
 
     $mismatchAdapter = Join-Path $tempRoot 'mismatch.py'
-    Write-TestAdapter $mismatchAdapter 'print("{\"protocol_version\":1,\"correlation_id\":\"other\",\"adapter_status\":\"healthy\",\"runtime_health\":{\"status\":\"healthy\"},\"core_health\":{\"status\":\"healthy\"},\"error\":null}")'
+    Write-TestAdapter $mismatchAdapter 'print("{\"protocol_version\":1,\"correlation_id\":\"other\",\"operation\":\"health\",\"adapter_status\":\"healthy\",\"runtime_health\":{\"status\":\"healthy\"},\"core_health\":{\"status\":\"healthy\"},\"error\":null}")'
     $mismatch = Invoke-MusicRenamerAdapterHealth -RuntimeRoot $ManagedRuntimeRoot -AdapterPath $mismatchAdapter -ManifestPath $manifest -CorrelationId 'expected'
     Assert-True ($mismatch.error.code -eq 'correlation_mismatch') 'correlation mismatch must fail closed'
 

@@ -245,7 +245,7 @@ function Invoke-MusicRenamerAdapterHealth {
     if ($raw.ExitCode -ne 0) {
         return New-MusicRenamerFailure $CorrelationId 'adapter_nonzero_exit' "Adapter exited with code $($raw.ExitCode)." $raw.Stderr
     }
-    foreach ($name in @('protocol_version', 'correlation_id', 'adapter_status', 'runtime_health', 'core_health', 'error')) {
+    foreach ($name in @('protocol_version', 'correlation_id', 'operation', 'adapter_status', 'runtime_health', 'core_health', 'error')) {
         if ($null -eq $response.PSObject.Properties[$name]) {
             return New-MusicRenamerFailure $CorrelationId 'malformed_transport' "Adapter response is missing '$name'." $raw.Stderr
         }
@@ -255,6 +255,9 @@ function Invoke-MusicRenamerAdapterHealth {
     }
     if ($response.correlation_id -ne $CorrelationId) {
         return New-MusicRenamerFailure $CorrelationId 'correlation_mismatch' 'Adapter response correlation ID does not match the request.' $raw.Stderr
+    }
+    if ($response.operation -ne 'health') {
+        return New-MusicRenamerFailure $CorrelationId 'invalid_response' 'Adapter response operation does not match the health request.' $raw.Stderr
     }
     if ($null -eq $response.runtime_health -or $null -eq $response.core_health) {
         return New-MusicRenamerFailure $CorrelationId 'malformed_transport' 'Adapter response health objects are missing.' $raw.Stderr
@@ -282,6 +285,129 @@ function Invoke-MusicRenamerAdapterHealth {
     return $response
 }
 
+function Invoke-MusicRenamerAdapterRename {
+    param(
+        [Parameter(Mandatory=$true)][string]$SourcePath,
+        [string]$Template = '{artist} - {title}',
+        [bool]$WarningAcknowledged = $false,
+        [object[]]$ArtistAliases = @(),
+        [object[]]$TitleCleanupRules = @(),
+        [bool]$EnableArtistQuotedTitle = $false,
+        [bool]$EnableTitleSlashArtist = $false,
+        [string]$CorrelationId = [guid]::NewGuid().ToString('D'),
+        [string]$RuntimeRoot = $script:DefaultRuntimeRoot,
+        [string]$AdapterPath = $script:DefaultAdapterPath,
+        [string]$ManifestPath = (Join-Path $RuntimeRoot 'integration-manifest.json'),
+        [ValidateRange(1, 300)][int]$TimeoutSeconds = 30
+    )
+    try { $resolved = Resolve-MusicRenamerManagedPython $RuntimeRoot }
+    catch { return New-MusicRenamerFailure $CorrelationId 'runtime_unavailable' $_.Exception.Message }
+    if (-not (Test-Path -LiteralPath $AdapterPath -PathType Leaf)) {
+        return New-MusicRenamerFailure $CorrelationId 'adapter_unavailable' "Adapter is unavailable: $AdapterPath"
+    }
+    $request = [ordered]@{
+        protocol_version = $script:ProtocolVersion
+        correlation_id = $CorrelationId
+        operation = 'rename'
+        source_path = $SourcePath
+        config = [ordered]@{
+            template = $Template
+            warning_acknowledged = $WarningAcknowledged
+            artist_aliases = @($ArtistAliases)
+            title_cleanup_rules = @($TitleCleanupRules)
+            extraction = [ordered]@{
+                artist_quoted_title = $EnableArtistQuotedTitle
+                title_slash_artist = $EnableTitleSlashArtist
+            }
+        }
+    }
+    try {
+        $raw = Invoke-MusicRenamerRawProcess -FileName $resolved.Executable -Arguments @($AdapterPath, '--manifest', $ManifestPath) -StandardInput ($request | ConvertTo-Json -Depth 10 -Compress) -TimeoutSeconds $TimeoutSeconds
+    } catch {
+        return New-MusicRenamerFailure $CorrelationId 'adapter_start_failed' $_.Exception.Message
+    }
+    if ($raw.TimedOut) {
+        return New-MusicRenamerFailure $CorrelationId 'adapter_timeout' 'Adapter timed out and was terminated.' $raw.Stderr
+    }
+    $lines = @($raw.Stdout -split "`r?`n" | Where-Object { $_.Trim().Length -gt 0 })
+    if ($lines.Count -ne 1) {
+        return New-MusicRenamerFailure $CorrelationId 'malformed_transport' 'Adapter stdout must contain exactly one JSON document.' $raw.Stderr
+    }
+    try { $response = $lines[0] | ConvertFrom-Json }
+    catch { return New-MusicRenamerFailure $CorrelationId 'malformed_transport' 'Adapter stdout is not valid JSON.' $raw.Stderr }
+    if ($raw.ExitCode -ne 0) {
+        return New-MusicRenamerFailure $CorrelationId 'adapter_nonzero_exit' "Adapter exited with code $($raw.ExitCode)." $raw.Stderr
+    }
+    foreach ($name in @('protocol_version', 'correlation_id', 'operation', 'adapter_status', 'classification', 'path', 'planning', 'preflight', 'execution', 'rejection_reason', 'error')) {
+        if ($null -eq $response.PSObject.Properties[$name]) {
+            return New-MusicRenamerFailure $CorrelationId 'malformed_transport' "Adapter rename response is missing '$name'." $raw.Stderr
+        }
+    }
+    if ($response.protocol_version -ne $script:ProtocolVersion) {
+        return New-MusicRenamerFailure $CorrelationId 'protocol_mismatch' 'Adapter response protocol does not match the request.' $raw.Stderr
+    }
+    if ($response.correlation_id -ne $CorrelationId) {
+        return New-MusicRenamerFailure $CorrelationId 'correlation_mismatch' 'Adapter response correlation ID does not match the request.' $raw.Stderr
+    }
+    if ($response.operation -ne 'rename' -or $response.adapter_status -ne 'completed') {
+        return New-MusicRenamerFailure $CorrelationId 'invalid_response' 'Adapter did not return a completed rename domain response.' $raw.Stderr
+    }
+    if ($response.classification -notin @('renamed', 'unchanged', 'rejected', 'failed', 'requires_attention')) {
+        return New-MusicRenamerFailure $CorrelationId 'invalid_response' 'Adapter returned an unknown rename classification.' $raw.Stderr
+    }
+    if ($null -ne $response.error) {
+        return New-MusicRenamerFailure $CorrelationId 'invalid_response' 'Completed rename response must not contain an infrastructure error.' $raw.Stderr
+    }
+    if ($null -eq $response.path -or $null -eq $response.planning) {
+        return New-MusicRenamerFailure $CorrelationId 'malformed_transport' 'Adapter rename response is missing path or planning projections.' $raw.Stderr
+    }
+    foreach ($name in @('original_path', 'destination_path', 'verified_final_path', 'final_location')) {
+        if ($null -eq $response.path.PSObject.Properties[$name]) {
+            return New-MusicRenamerFailure $CorrelationId 'malformed_transport' "Adapter path projection is missing '$name'." $raw.Stderr
+        }
+    }
+    foreach ($name in @('status', 'destination_path', 'issue_codes', 'issues', 'warnings', 'errors', 'metadata')) {
+        if ($null -eq $response.planning.PSObject.Properties[$name]) {
+            return New-MusicRenamerFailure $CorrelationId 'malformed_transport' "Adapter planning projection is missing '$name'." $raw.Stderr
+        }
+    }
+    if ($response.path.final_location -in @('missing', 'unknown') -and $null -ne $response.path.verified_final_path) {
+        return New-MusicRenamerFailure $CorrelationId 'invalid_response' 'Unknown or missing final location must not claim a verified final path.' $raw.Stderr
+    }
+    if ($response.path.final_location -in @('missing', 'unknown') -and $response.classification -ne 'requires_attention') {
+        return New-MusicRenamerFailure $CorrelationId 'invalid_response' 'Unknown or missing final location must require attention.' $raw.Stderr
+    }
+    if ($response.classification -ne 'rejected' -and $null -eq $response.execution) {
+        return New-MusicRenamerFailure $CorrelationId 'invalid_response' 'Non-rejected rename result must include a Core execution projection.' $raw.Stderr
+    }
+    if ($null -ne $response.execution) {
+        foreach ($name in @('transaction_id', 'plan_id', 'outcome', 'preflight_issues', 'operations')) {
+            if ($null -eq $response.execution.PSObject.Properties[$name]) {
+                return New-MusicRenamerFailure $CorrelationId 'malformed_transport' "Adapter execution projection is missing '$name'." $raw.Stderr
+            }
+        }
+        if ($response.execution.outcome -eq 'failed_rollback_incomplete' -and $response.classification -ne 'requires_attention') {
+            return New-MusicRenamerFailure $CorrelationId 'invalid_response' 'Incomplete recovery must require attention.' $raw.Stderr
+        }
+        $expectedClassification = switch ($response.execution.outcome) {
+            'succeeded' { 'renamed' }
+            'no_op' { 'unchanged' }
+            'preflight_rejected' { 'rejected' }
+            'failed_rolled_back' { 'failed' }
+            'failed_rollback_incomplete' { 'requires_attention' }
+            default { $null }
+        }
+        if ($null -eq $expectedClassification) {
+            return New-MusicRenamerFailure $CorrelationId 'invalid_response' 'Adapter returned an unknown Core transaction outcome.' $raw.Stderr
+        }
+        if ($response.path.final_location -notin @('missing', 'unknown') -and $response.classification -ne $expectedClassification) {
+            return New-MusicRenamerFailure $CorrelationId 'invalid_response' 'Rename classification does not match the Core transaction outcome.' $raw.Stderr
+        }
+    }
+    $response | Add-Member -NotePropertyName diagnostics -NotePropertyValue $raw.Stderr
+    return $response
+}
+
 Export-ModuleMember -Function @(
     'Get-MusicRenamerManagedPythonPath',
     'Resolve-MusicRenamerManagedPython',
@@ -289,5 +415,6 @@ Export-ModuleMember -Function @(
     'Get-MusicRenamerProjectVersion',
     'Write-MusicRenamerRuntimeManifest',
     'Install-MusicRenamerManagedRuntime',
-    'Invoke-MusicRenamerAdapterHealth'
+    'Invoke-MusicRenamerAdapterHealth',
+    'Invoke-MusicRenamerAdapterRename'
 )
