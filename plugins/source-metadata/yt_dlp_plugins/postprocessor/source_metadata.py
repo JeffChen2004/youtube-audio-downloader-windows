@@ -16,6 +16,11 @@ if mutagen:
     from mutagen.wave import WAVE
 
 
+# Process-local admission signal, not an embedded tag or public metadata field.
+# yt-dlp's clean info serialization removes double-underscore private keys.
+SOURCE_METADATA_SUCCESS_KEY = '__yad_source_metadata_finalized_v1'
+
+
 class SourceMetadataPP(PostProcessor):
     """Persist the exact selected YouTube audio format in the output file."""
 
@@ -210,6 +215,8 @@ class SourceMetadataPP(PostProcessor):
         return tags, standard, source_line, format_id, codec, abr_display
 
     def run(self, info):
+        # A reused info dictionary must not retain success from an earlier run.
+        info.pop(SOURCE_METADATA_SUCCESS_KEY, None)
         if not mutagen:
             raise PostProcessingError('yt-dlp build does not include mutagen; source metadata was not written')
 
@@ -241,6 +248,7 @@ class SourceMetadataPP(PostProcessor):
             self.to_screen(f'[Output] .{ext}; audio stream copied without re-encoding')
         else:
             self.to_screen(f'[Output] .{ext}; metadata tagging added no further audio re-encoding')
+        info[SOURCE_METADATA_SUCCESS_KEY] = True
         return [], info
 
 

@@ -58,3 +58,11 @@ state, errors, final location, and verified path. There is no persisted settings
 schema, automatic download integration, Undo, or production retry policy.
 
 Do not put credentials or authentication state in the request or result.
+
+## Downloader lifecycle contract tests (Phase 2.5)
+
+The separate [offline lifecycle harness](../../tests/lifecycle/README.md) runs
+the bundled yt-dlp executable with generated localhost fixtures and test-only
+postprocessors. It verifies SourceMetadata admission, archive timing,
+`after_video`, playlist isolation, and the existing PowerShell accounting
+behavior. It does not call this adapter or install a production Renamer hook.
