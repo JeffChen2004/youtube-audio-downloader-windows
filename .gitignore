@@ -36,6 +36,7 @@ youtube.cookies.txt
 /tools/deno.exe
 /tools/yt-dlp-plugins/
 /tools/po-token-provider/
+/tools/music-renamer-runtime/
 
 # Temporary and downloaded package files
 *.tmp
