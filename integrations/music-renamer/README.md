@@ -3,6 +3,8 @@
 This directory contains the managed runtime/bootstrap, adapter contract harness,
 and the invocation used by the opt-in production post-download hook. Naming,
 planning, preflight, mutation, and recovery remain owned by Music Renamer Core.
+Phases 1–4 are completed development milestones; phase labels below identify
+implementation history, not pending production hook or GUI work.
 
 ## Bootstrap
 
@@ -25,6 +27,40 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
 Git is not used by the runtime or adapter. Supplying the expected commit is a
 development-time identity assertion recorded in the manifest; package version
 and imported source location are independently checked on every health call.
+
+## Current distribution boundary
+
+The current supported development/runtime model is:
+
+```text
+Downloader-managed Python runtime
++ explicit Music Renamer repository checkout
++ editable music-renamer-core install
+```
+
+For first-time setup, obtain a separate Music Renamer repository checkout and
+run the bootstrap above from the Downloader root, replacing `$core` with that
+checkout's actual source path. Downloader does not use ambient/global Python.
+The editable install depends on that checkout remaining available at its
+configured path; moving or deleting it can make Core import or source identity
+validation fail. Reinitialize against the intended checkout path before enabling
+renaming again, then run the health check below.
+
+Health verifies Python version compatibility, Core package version, imported
+source path, required public API, and PySide6 isolation. The manifest can record
+an expected Git commit, but runtime health does not verify the entire checkout
+against an immutable content digest. Editing the checkout without changing its
+package version/path is not detected as a content identity change.
+
+This is not a self-contained installer, bundled Core, immutable Core artifact,
+or published/pinned wheel distribution. Pinned wheels, a packaged adapter
+executable, self-contained distribution, and immutable artifact verification
+are future packaging improvements, not prerequisites for releasing the current
+source-plus-manual-bootstrap model.
+
+When integration is disabled, Downloader remains usable without this optional
+runtime. When enabled, pre-job health/validation failure stops the affected job;
+it never silently disables Renamer and continues downloading.
 
 ## Health check
 
@@ -53,8 +89,9 @@ recovery failures are successful transport exchanges with
 populated only from the Core execution result.
 
 The result projects Core status, issues, transaction outcome, forward/rollback
-state, errors, final location, and verified path. There is no persisted settings
-schema, Downloader Undo, or production retry policy.
+state, errors, final location, and verified path. Downloader-owned persisted
+settings use schema version 1 at `data/music-renamer.json`, as described below.
+There is no Downloader Undo or automatic rename retry.
 
 Do not put credentials or authentication state in the request or result.
 
@@ -68,7 +105,7 @@ behavior. It does not call this adapter or install a production Renamer hook.
 
 ## Production hook (Phase 3)
 
-Phase 4 adds a visible GUI entry point and Downloader-owned persisted settings;
+The completed GUI provides opt-in and Downloader-owned persisted settings;
 the explicit CLI opt-in below remains compatible. Without a CLI override,
 headless/scheduled jobs consume the persisted settings described below.
 
@@ -81,8 +118,10 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\YoutubeAudioDownloader
 
 For a development/integration configuration, add `-MusicRenamerConfigPath` with
 an explicit JSON file. The same switches work alongside `-HeadlessTrackedConfig`.
-No Music Renamer GUI settings are read, no tracker schema is changed, and no
-settings are persisted. Phase 4 has not supplied a GUI editor.
+These explicit CLI overrides do not overwrite persisted settings. No Music
+Renamer GUI private settings are read, and the tracker schema is unchanged.
+The GUI supports enable/disable, template, extraction toggles and warning
+acknowledgement; Alias / Cleanup remain config-only without GUI editors.
 
 The conservative default snapshot is:
 
@@ -102,7 +141,8 @@ It requires the private SourceMetadata success flag, an accessible absolute
 final path, a supported Opus/M4A container, and nonempty final SOURCE_FORMAT_ID,
 SOURCE_CODEC, and matching YOUTUBE_ID tags. These are admission checks only;
 the Core reader still interprets all naming metadata. Unsupported MP3/FLAC/WAV
-outputs return `unsupported` without invoking the adapter.
+outputs return `unsupported` without invoking the adapter. These formats remain
+supported by Downloader; the Renamer skip is not a download failure.
 
 The PP invokes `Invoke-MusicRenamerRename.ps1` using the absolute Windows
 PowerShell executable. That launcher accepts the existing adapter JSON request,
@@ -125,6 +165,10 @@ contain codes/type/elapsed time, not the adapter response or auth material.
 The Downloader stores events in a separate RenameResults collection, without
 rewriting its existing download Success/Failed sets.
 
+User-facing outcomes include renamed (`succeeded`), unchanged, rejected, failed,
+requires attention, and unsupported. Rename failure does not by itself mean
+media download failure; `requires_attention` calls for manual inspection.
+
 Completion adds rename counts and an explicit job status: `completed`,
 `completed_with_rename_errors`, `failed`, or `cancelled`. Requires-attention
 results also set the attention flag. For headless callers, the backward-compatible
@@ -146,7 +190,8 @@ consumer path. A contradictory verified-path claim fails closed.
 
 Private fields are absent from embedded tags and normal clean info JSON. Explicit
 raw debug serialization of private info is not a user-facing contract. No bridge
-code reads or writes archive files; yt-dlp remains the archive owner. Domain
+code reads or writes archive files or adds/removes entries; yt-dlp remains the
+archive owner. Domain
 rejection or handled failure never triggers redownload or automatic rename retry.
 
 Cancellation is transaction-aware. A job-owned named mutex protects the bridge
@@ -210,8 +255,9 @@ and infrastructure errors retain failure exit semantics. Health/rename contracts
 remain compatible.
 
 Settings belong to Downloader, at ignored `data/music-renamer.json`, not
-`%APPDATA%\Music Renamer` or tracker JSON. Tracker schema v1 is unchanged. Missing
-settings mean deterministic disabled defaults and do not create a file:
+`%APPDATA%\Music Renamer\settings.json` or tracker JSON. Tracker schema v1 is
+unchanged. Missing settings mean deterministic disabled defaults and do not
+create a file:
 
 ```json
 {
@@ -251,8 +297,11 @@ these arrays when saving basic controls. Examples of array entries:
 `{"source":"旧名","target":"正式名"}` and
 `{"kind":"remove_suffix","text":" (official)"}`. Cleanup kinds are the existing
 Core `remove_prefix`/`remove_suffix`; duplicate/conflicting rules are validated by
-Core. Extraction stays explicitly `Artist「Title」` then `Title ⧸ Artist`;
-normalization stays aliases then cleanup. This is not a clone of Music Renamer GUI.
+Core. The only supported extraction rules are `Artist「Title」` then `Title ⧸ Artist`;
+the second rule uses Unicode `⧸`, not ordinary `/`. Generic dash extraction,
+`(Cover)`, `covered by`, `cover ver.`, and Official Music Video parsing are not
+supported extraction patterns.
+Normalization stays aliases then cleanup. This is not a clone of Music Renamer GUI.
 
 Job startup captures GUI state (or persisted config for headless), validates
 shape, managed runtime health, manifest-bound Core identity, PySide6 isolation,
@@ -280,6 +329,27 @@ request safe cancellation without pausing Core. It offers no hard-kill route.
 Terminal recovery truth is retained. A hung Core may delay cancellation indefinitely;
 external kill/crash/OS failure remain fail-closed, not crash-safe. No Undo, retries,
 new patterns, shared GUI settings, telemetry or observation dataset are added.
+
+## Known limitations
+
+- Renaming applies only to `.opus` / `.m4a`; other Downloader formats safely skip
+  Renamer without becoming download failures.
+- Artist Alias / Title Cleanup are config-only, without Downloader GUI editors.
+- There is no Downloader Undo or automatic rename retry, and only the two
+  extraction rules listed above are supported.
+- Integration is per-file, not a playlist-wide transaction. Core owns Planner,
+  preflight and Executor mutation with no-overwrite semantics and best-effort
+  rollback; recovery is not atomic, ACID or crash-safe.
+- Only verified final paths are usable. Missing/unknown locations are not guessed;
+  incomplete recovery requires attention.
+- Normal cancellation does not hard-kill active filesystem mutation. A permanently
+  stuck execution may keep safe cancellation pending; external kill, OS crash or
+  power loss can prevent a terminal result.
+- The current runtime requires a separate available Core checkout and editable
+  install. Self-contained packaging is not implemented; the future packaging
+  options above do not block release of this documented runtime model.
+
+## GUI/settings focused verification
 
 Phase 4 focused tests (generated copies only):
 
