@@ -296,6 +296,11 @@ $PlaylistTrackerScript = Join-Path $AppRoot 'PlaylistTracker.ps1'
 if (-not (Test-Path -LiteralPath $PlaylistTrackerScript -PathType Leaf)) { throw "找不到播放清單追蹤模組：$PlaylistTrackerScript" }
 . $PlaylistTrackerScript
 Initialize-PlaylistTrackerStorage $AppRoot
+Import-Module (Join-Path $AppRoot 'integrations\music-renamer\MusicRenamerSettings.psm1')
+Import-Module (Join-Path $AppRoot 'integrations\music-renamer\MusicRenamerIntegration.psm1')
+$Script:MusicRenamerSettingsPath = Join-Path $AppRoot 'data\music-renamer.json'
+$Script:TrackerRenamerSettings = $null
+$Script:RenamerRequested = $false
 $Script:ActiveProcess = $null
 $Script:DownloadJobHandle = [IntPtr]::Zero
 $Script:RenamerJobGate = $null
@@ -1133,6 +1138,13 @@ function Start-TrackedPlaylistBatch([string[]]$ConfigPaths = @()) {
         [System.Windows.Forms.MessageBox]::Show('目前沒有已啟用的追蹤播放清單。', '播放清單追蹤', 'OK', 'Information') | Out-Null
         return
     }
+    try {
+        # Capture the entire batch before queueing any tracker or child process.
+        $Script:TrackerRenamerSettings = Get-DownloadRenamerSnapshot $false
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'Music Renamer 設定／runtime 未就緒', 'OK', 'Error') | Out-Null
+        return
+    }
     $Script:TrackedPlaylistQueue.Clear()
     foreach ($path in $ConfigPaths) { $Script:TrackedPlaylistQueue.Enqueue($path) }
     $Script:TrackerBatchActive = $true
@@ -1273,7 +1285,7 @@ function Write-DownloadProcessLine([string]$Line, [bool]$PreserveSource, $Statis
                 throw 'Invalid rename path/attention projection'
             }
             $Statistics.RenameResults["video:$($result.id)"] = $result
-            Write-Log "[Rename] item=$($result.id); status=$($result.rename_status); issue=$($result.issue_code); path=$($result.path_validity)"
+            Write-Log "[Rename] item=$($result.id); $(Get-MusicRenamerResultText $result)"
         } catch {
             $Statistics.RenameTransportFailure = $true
             Write-Log '[Rename] Invalid structured rename result; job cannot be reported fully successful.'
@@ -1317,6 +1329,7 @@ function Write-DownloadProcessLine([string]$Line, [bool]$PreserveSource, $Statis
             [void]$Statistics.Items.Add($key)
             if (-not $Statistics.Skipped.Contains($key)) { [void]$Statistics.Success.Add($key) }
             [void]$Statistics.Failed.Remove($key)
+            if (-not $Statistics.RenameEnabled) { Write-Log "[Rename] item=$($item.id)；未套用 Music Renamer：未啟用 [not_requested]" }
         } catch { Write-Log "[Summary] 無法解析項目完成紀錄：$($_.Exception.Message)" }
         return
     }
@@ -1412,7 +1425,7 @@ function Get-DownloadJobProjection($Statistics, [bool]$Stopped, [bool]$ProcessFa
 
 function Write-RenameSummary($Statistics) {
     if (-not $Statistics.RenameEnabled -and $Statistics.RenameResults.Count -eq 0 -and -not $Statistics.RenameTransportFailure) { return }
-    foreach ($status in @('succeeded','unchanged','rejected','failed','requires_attention','unsupported','infrastructure_failed')) {
+    foreach ($status in @('succeeded','unchanged','rejected','failed','requires_attention','unsupported','infrastructure_failed','cancelled')) {
         $count = @($Statistics.RenameResults.Values | Where-Object { $_.rename_status -eq $status }).Count
         Write-Log "[Rename Summary] ${status}: $count"
     }
@@ -1461,7 +1474,11 @@ function Request-RenamerSafeStop {
     try { $owned = $Script:RenamerJobGate.WaitOne(0) }
     catch [System.Threading.AbandonedMutexException] { $owned = $true }
     if ($owned) { return $true } # caller releases after termination/close
-    if (-not $Script:RenamerStopLogged) { Write-Log '[Rename] Stop deferred until terminal Core result is projected.'; $Script:RenamerStopLogged=$true }
+    if (-not $Script:RenamerStopLogged) {
+        Write-Log '[Rename] 正在完成安全檔案操作；等待 Core 最終／恢復結果，不會強制終止。'
+        $cancelButton.Text='正在完成安全檔案操作…'
+        $Script:RenamerStopLogged=$true
+    }
     return $false
 }
 
@@ -1576,7 +1593,11 @@ function Stop-DownloadProcessTree {
 
 function Show-DownloadControlDialog {
     if ($Script:DownloadState -eq 'Running') {
-        if (-not (Suspend-DownloadProcess)) { return }
+        if (-not (Suspend-DownloadProcess)) {
+            $choice=[System.Windows.Forms.MessageBox]::Show($form,'正在進行安全檔案操作，不能暫停。是否請求安全取消？取消會等待最終／恢復結果。','Music Renamer','YesNo','Question')
+            if ($choice -eq 'Yes') { Stop-DownloadProcessTree }
+            return
+        }
     } elseif ($Script:DownloadState -ne 'Paused') {
         return
     }
@@ -1753,6 +1774,7 @@ function Complete-DownloadSession($Context) {
         $jobProjection = Get-DownloadJobProjection $Context.Statistics $Script:DownloadCancelled $processFailed
         if ($Context.Statistics.RenameEnabled -or $Context.Statistics.RenameResults.Count -gt 0 -or $Context.Statistics.RenameTransportFailure) {
             Write-Log "[Job] status=$($jobProjection.status); requires_attention=$($jobProjection.requires_attention)"
+            Write-Log (Get-MusicRenamerJobText $jobProjection)
         }
         if ($Context.TrackerConfiguration) {
             $trackerSuccessful = $jobProjection.status -eq 'completed'
@@ -1829,6 +1851,25 @@ function Update-DownloadSession {
     }
 }
 
+function Get-DownloadRenamerSnapshot([bool]$IsTracker) {
+    # Headless never reads UI. Legacy CLI opt-in remains explicit and compatible.
+    if ($IsTracker -and $Script:TrackerBatchActive) {
+        $Script:RenamerRequested=-not [string]::IsNullOrWhiteSpace($Script:TrackerRenamerSettings)
+        return $Script:TrackerRenamerSettings
+    }
+    if ($Script:HeadlessMode -and $EnableMusicRenamer) {
+        Import-Module (Join-Path $AppRoot 'integrations\music-renamer\MusicRenamerIntegration.psm1')
+        $config=New-MusicRenamerDownloadSnapshot -Enabled -ConfigPath $MusicRenamerConfigPath | ConvertFrom-Json
+        $config | Add-Member -NotePropertyName schema_version -NotePropertyValue 1
+        $config | Add-Member -NotePropertyName enabled -NotePropertyValue $true
+        $settings=$config
+    } elseif ($Script:HeadlessMode) {
+        $settings=Read-MusicRenamerSettings $Script:MusicRenamerSettingsPath
+    } else { $settings=Get-GuiMusicRenamerSettings }
+    $Script:RenamerRequested=$settings.enabled
+    return New-MusicRenamerJobSnapshot $settings
+}
+
 function Start-Download {
     param(
         $TrackerConfiguration = $null,
@@ -1852,13 +1893,10 @@ function Start-Download {
     try {
         $startButton.Enabled = $false
         $cancelButton.Enabled = $true
+        $renameSnapshot = Get-DownloadRenamerSnapshot ([bool]$TrackerConfiguration)
+        $downloadStatistics.RenameEnabled = -not [string]::IsNullOrWhiteSpace($renameSnapshot)
+        Write-Log $(if ($downloadStatistics.RenameEnabled) {'[Rename] 已啟用；本工作使用已驗證的固定設定。'} else {'[Rename] 未啟用；下載行為不變。'})
         Ensure-Tools
-        $renameSnapshot = $null
-        if ($EnableMusicRenamer) {
-            Import-Module (Join-Path $AppRoot 'integrations\music-renamer\MusicRenamerIntegration.psm1') -Force
-            $renameSnapshot = New-MusicRenamerDownloadSnapshot -Enabled -ConfigPath $MusicRenamerConfigPath
-            $downloadStatistics.RenameEnabled = $true
-        }
 
         $format = if ($TrackerConfiguration -and $TrackerConfiguration.audio_format) { [string]$TrackerConfiguration.audio_format } else { $formatBox.SelectedItem.ToString().ToLowerInvariant() }
         $qualityMode = if ($TrackerConfiguration -and $TrackerConfiguration.quality_mode) { [string]$TrackerConfiguration.quality_mode } else { $qualityModeBox.SelectedItem.ToString() }
@@ -2061,6 +2099,7 @@ function Start-Download {
             if ($Script:HeadlessMode) {
                 $Script:HeadlessLastResult = [pscustomobject]@{
                     success = $false
+                    rename_requested = $Script:RenamerRequested
                     new_videos_downloaded = 0
                     no_change = $false
                     failed_items = 0
@@ -2123,7 +2162,7 @@ if ($Script:HeadlessMode) {
         status = if ($Script:HeadlessLastResult.status) { $Script:HeadlessLastResult.status } elseif ($Script:HeadlessLastResult.success) { 'completed' } else { 'failed' }
         download_success = if ($null -ne $Script:HeadlessLastResult.PSObject.Properties['download_success']) { [bool]$Script:HeadlessLastResult.download_success } else { [bool]$Script:HeadlessLastResult.success }
         requires_attention = [bool]$Script:HeadlessLastResult.requires_attention
-        rename_requested = [bool]$EnableMusicRenamer
+        rename_requested = if ($null -ne $Script:HeadlessLastResult.PSObject.Properties['rename_requested']) { [bool]$Script:HeadlessLastResult.rename_requested } else { [bool]$EnableMusicRenamer }
         rename_results = @($Script:HeadlessLastResult.rename_results | Where-Object { $null -ne $_ })
         new_videos_downloaded = [int]$Script:HeadlessLastResult.new_videos_downloaded
         no_change = [bool]$Script:HeadlessLastResult.no_change
@@ -2146,6 +2185,7 @@ $downloadTab = [System.Windows.Forms.TabPage]@{ Text='下載'; Padding=[System.W
 $trackerTab = [System.Windows.Forms.TabPage]@{ Text='播放清單追蹤'; Padding=[System.Windows.Forms.Padding]::new(3) }
 $tabControl.TabPages.AddRange(@($downloadTab,$trackerTab))
 $form.Controls.Add($tabControl)
+. (Join-Path $AppRoot 'integrations\music-renamer\MusicRenamerGui.ps1')
 
 $panel = [System.Windows.Forms.TableLayoutPanel]@{ Dock = 'Fill'; Padding = [System.Windows.Forms.Padding]::new(18); ColumnCount = 2; RowCount = 10 }
 [void]$panel.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Absolute, 118))

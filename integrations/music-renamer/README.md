@@ -1,4 +1,4 @@
-# Music Renamer integration — Phases 1–3
+# Music Renamer integration — Phases 1–4
 
 This directory contains the managed runtime/bootstrap, adapter contract harness,
 and the invocation used by the opt-in production post-download hook. Naming,
@@ -67,6 +67,10 @@ postprocessors. It verifies SourceMetadata admission, archive timing,
 behavior. It does not call this adapter or install a production Renamer hook.
 
 ## Production hook (Phase 3)
+
+Phase 4 adds a visible GUI entry point and Downloader-owned persisted settings;
+the explicit CLI opt-in below remains compatible. Without a CLI override,
+headless/scheduled jobs consume the persisted settings described below.
 
 Renaming is disabled by default. Opt in for the Downloader process explicitly:
 
@@ -192,3 +196,96 @@ load the real Downloader process controller, exercise safe startup cleanup, and
 run real Core staging/rollback barriers under the bundled yt-dlp process. Tests
 cover pre-mutation cancellation, planning/preflight, success after stop, restored
 failure, incomplete recovery, mutation timeout and an actual adapter crash.
+
+## GUI, settings and result presentation (Phase 4)
+
+The Music Renamer tab provides opt-in, template input, Core validation feedback,
+the two existing extraction toggles, and a global explicit warning acknowledgement
+(false by default). Validation is also enforced at job start, not only by UI.
+No local template parser, alias grammar, extraction pattern, planner or executor
+is introduced. `validate_config` is a non-mutating adapter operation using the
+same `_translate_config` and public Core validators as `rename`. Invalid domain
+configuration returns a normal single JSON response with issue codes; transport
+and infrastructure errors retain failure exit semantics. Health/rename contracts
+remain compatible.
+
+Settings belong to Downloader, at ignored `data/music-renamer.json`, not
+`%APPDATA%\Music Renamer` or tracker JSON. Tracker schema v1 is unchanged. Missing
+settings mean deterministic disabled defaults and do not create a file:
+
+```json
+{
+  "schema_version": 1,
+  "enabled": false,
+  "template": "{artist} - {title} [{youtube_id}]",
+  "warning_acknowledged": false,
+  "artist_aliases": [],
+  "title_cleanup_rules": [],
+  "extraction": {
+    "artist_quoted_title": false,
+    "title_slash_artist": false
+  }
+}
+```
+
+All fields are required; unknown fields/versions and malformed/type-invalid JSON
+fail closed with no partial application, migration, rewrite or template fallback.
+There is no older versioned settings schema to migrate. Future migration requires
+an explicit separate implementation. Legacy `-EnableMusicRenamer
+-MusicRenamerConfigPath <path>` still accepts the Phase 3 unversioned adapter
+config (without schema_version/enabled), by explicit request only; it does not
+silently import or overwrite persisted settings. In GUI mode that opt-in is
+reflected in the visible controls. In headless it overrides persisted settings.
+
+Saving uses a same-directory unique UTF-8 temp and atomic File.Replace/File.Move,
+with temp cleanup and preservation of old bytes on failure. Saving enabled
+settings requires runtime health and full semantic validation. Disabled settings
+can be saved without the optional runtime; their semantics must still pass Core
+before enabling or starting any rename. GUI load errors block use/save until the
+file is repaired externally and the app restarted; displayed disabled defaults
+are not applied as a fallback for a corrupt file.
+
+Aliases/cleanup are config-only in this first UI. Save once to obtain the complete
+schema, close Downloader, edit JSON, then reopen and validate. The GUI preserves
+these arrays when saving basic controls. Examples of array entries:
+`{"source":"旧名","target":"正式名"}` and
+`{"kind":"remove_suffix","text":" (official)"}`. Cleanup kinds are the existing
+Core `remove_prefix`/`remove_suffix`; duplicate/conflicting rules are validated by
+Core. Extraction stays explicitly `Artist「Title」` then `Title ⧸ Artist`;
+normalization stays aliases then cleanup. This is not a clone of Music Renamer GUI.
+
+Job startup captures GUI state (or persisted config for headless), validates
+shape, managed runtime health, manifest-bound Core identity, PySide6 isolation,
+and Core semantics, then passes immutable adapter-config JSON into the existing
+bridge. An entire queued GUI tracker batch captures one snapshot before queueing.
+No item rereads settings or controls; edits during a job/batch affect only the next
+one. GUI drafts do not automatically affect scheduled jobs: press Save. Health
+failure is actionable before tool setup/child launch, never auto-disable-and-run.
+Headless imports only nonvisual modules and shares the same validation/pipeline.
+
+Per-item human logs include machine status, short issue code and only verified
+paths, independent of the compact machine events. `not_requested` is a display
+state for disabled integration; `unsupported` is a safe skip for non-Opus/M4A;
+`succeeded`/`unchanged` are normal; `rejected` reports issue and verified original
+path; `failed` reports whether Core restored the source; `requires_attention`
+is prominently marked for manual inspection. Unverified/missing/unknown locations
+display `最終檔案位置無法確認` without stale filepath. No guessed destination is shown.
+Independent Music Renamer counters include cancellation and infrastructure
+failure; the download success/failure/skipped sets and yt-dlp archive are untouched.
+`completed_with_rename_errors` is labelled partial rename completion, not download
+failure. `cancelled` retains the separate attention flag and actual Core result.
+
+Stop during a protected operation shows `正在完成安全檔案操作`; the stop control can
+request safe cancellation without pausing Core. It offers no hard-kill route.
+Terminal recovery truth is retained. A hung Core may delay cancellation indefinitely;
+external kill/crash/OS failure remain fail-closed, not crash-safe. No Undo, retries,
+new patterns, shared GUI settings, telemetry or observation dataset are added.
+
+Phase 4 focused tests (generated copies only):
+
+```powershell
+$env:PYTHONDONTWRITEBYTECODE = '1'
+pwsh -NoProfile -File tests/music-renamer/Phase4.Tests.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File tests/music-renamer/Phase4.Tests.ps1 -Gui
+& tools/music-renamer-runtime/python.exe -B -m unittest discover -s tests/music-renamer -p test_adapter_config.py -v
+```

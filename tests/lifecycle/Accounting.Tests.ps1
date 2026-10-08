@@ -5,6 +5,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+Import-Module (Join-Path $repoRoot 'integrations/music-renamer/MusicRenamerSettings.psm1')
 $sourcePath = Join-Path $repoRoot 'YoutubeAudioDownloader.ps1'
 $tokens = $null
 $parseErrors = $null

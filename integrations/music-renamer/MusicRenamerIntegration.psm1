@@ -446,6 +446,31 @@ function Invoke-MusicRenamerAdapterRename {
     return $response
 }
 
+function Invoke-MusicRenamerConfigValidation {
+    param([Parameter(Mandatory=$true)][string]$Snapshot,
+          [string]$RuntimeRoot=$script:DefaultRuntimeRoot,
+          [string]$AdapterPath=$script:DefaultAdapterPath,
+          [string]$ManifestPath=(Join-Path $RuntimeRoot 'integration-manifest.json'))
+    $resolved = Resolve-MusicRenamerManagedPython $RuntimeRoot
+    $id = [guid]::NewGuid().ToString('D')
+    $request = [ordered]@{protocol_version=1; correlation_id=$id; operation='validate_config'; config=($Snapshot | ConvertFrom-Json)}
+    $raw = Invoke-MusicRenamerRawProcess -FileName $resolved.Executable -Arguments @($AdapterPath,'--manifest',$ManifestPath) -StandardInput ($request | ConvertTo-Json -Depth 20 -Compress) -TimeoutSeconds 30
+    if ($raw.TimedOut -or $raw.ExitCode -ne 0) { throw 'Music Renamer config validation transport failed; check the managed runtime/bootstrap.' }
+    $lines = @($raw.Stdout -split "`r?`n" | Where-Object { $_.Trim().Length })
+    if ($lines.Count -ne 1) { throw 'Invalid config validation stdout contract.' }
+    $response = $lines[0] | ConvertFrom-Json
+    foreach ($name in @('protocol_version','correlation_id','operation','adapter_status','valid','issues','error')) {
+        if ($null -eq $response.PSObject.Properties[$name]) { throw 'Incomplete config validation response.' }
+    }
+    if ($response.protocol_version -ne 1 -or $response.correlation_id -ne $id -or
+        $response.operation -ne 'validate_config' -or $response.adapter_status -ne 'completed' -or
+        $response.valid -isnot [bool] -or $response.issues -isnot [array] -or $null -ne $response.error -or
+        ($response.valid -and $response.issues.Count -ne 0) -or (-not $response.valid -and $response.issues.Count -eq 0)) {
+        throw 'Invalid config validation response contract.'
+    }
+    return $response
+}
+
 function ConvertTo-MusicRenamerConfigSnapshot($Config) {
     # Validate only snapshot shape; Core/adapter owns all naming semantics.
     $required = @('template','warning_acknowledged','artist_aliases','title_cleanup_rules','extraction')
@@ -493,6 +518,7 @@ Export-ModuleMember -Function @(
     'Install-MusicRenamerManagedRuntime',
     'Invoke-MusicRenamerAdapterHealth',
     'Invoke-MusicRenamerAdapterRename',
+    'Invoke-MusicRenamerConfigValidation',
     'ConvertTo-MusicRenamerConfigSnapshot',
     'New-MusicRenamerDownloadSnapshot',
     'Get-MusicRenamerPostprocessorArguments'

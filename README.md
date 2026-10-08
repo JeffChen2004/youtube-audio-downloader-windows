@@ -31,6 +31,18 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\YoutubeAudioDownloader
 
 下載結果預設位於 `downloads/`。
 
+## Music Renamer（選用）
+
+在「Music Renamer」分頁勾選「下載完成後使用 Music Renamer 命名」，設定 template、兩個 extraction 開關與明確 warning 同意，再按「驗證並儲存設定」。預設停用、不同意 warnings；啟用前需要先依 [integration bootstrap 說明](integrations/music-renamer/README.md) 安裝 managed runtime。開始工作前會再次驗證 Core 設定／runtime；失敗會停止，不會偷偷關閉 integration 後繼續。
+
+預設 template 為 `{artist} - {title} [{youtube_id}]`；語法由 Core 驗證，缺少必要 metadata 可能使個別項目被拒絕。只支援 `.opus`／`.m4a` 命名；MP3、FLAC、WAV 等顯示「格式不支援」，仍照原 Downloader 能力下載。
+
+Downloader 自有 versioned 設定位於 `data/music-renamer.json`，不讀 Music Renamer GUI settings。Alias／cleanup 第一版只支援編輯這份 JSON：請先儲存，再關閉程式、按 integration 文件編輯並重新啟動驗證。UI 未儲存的設定用於下一個 GUI 工作；headless／排程只讀已儲存設定。已啟動工作及追蹤批次固定使用 snapshot，下載途中變更只影響下一次。
+
+下載／追蹤執行紀錄會分別顯示每首 rename 結果與 Music Renamer counters，不改 downloaded／failed／skipped。`succeeded` 是已命名、`unchanged` 是不需變更、`rejected` 是拒絕且未修改、`failed` 會顯示恢復狀態、`requires_attention` 明確要求人工檢查。部分命名問題顯示「下載完成，但 Music Renamer 有待處理結果」，不是單純下載失敗。只有 verified path 可當作目前檔案位置；否則顯示「最終檔案位置無法確認」。
+
+取消若遇到 Core 檔案操作會顯示「正在完成安全檔案操作」，等待真正 terminal／recovery 結果；不能強制終止，關閉視窗也需等待。取消不覆蓋 recovery incomplete；外部 kill／crash 不受此保證。沒有 Downloader Undo、retry、觀測資料收集或新增 extraction patterns。
+
 ## 下載與品質
 
 GUI 的「下載」Tab 支援：

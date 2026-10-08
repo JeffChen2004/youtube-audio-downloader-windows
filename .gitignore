@@ -17,6 +17,7 @@ youtube.cookies.txt
 
 # Runtime playlist state
 /data/tracked-playlists/
+/data/music-renamer.json
 
 # Runtime logs
 /logs/

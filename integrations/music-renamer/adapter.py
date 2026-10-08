@@ -73,8 +73,8 @@ def _validate_request(request: dict[str, Any]) -> tuple[str, str]:
         raise AdapterFailure("unsupported_protocol", "protocol_version must be 1")
     correlation_id = _required_string(request.get("correlation_id"), "correlation_id")
     operation = request.get("operation")
-    if operation not in {"health", "rename"}:
-        raise AdapterFailure("unsupported_operation", "operation must be 'health' or 'rename'")
+    if operation not in {"health", "rename", "validate_config"}:
+        raise AdapterFailure("unsupported_operation", "operation must be 'health', 'rename' or 'validate_config'")
     return correlation_id, operation
 
 
@@ -235,6 +235,18 @@ def _translate_config(core: Any, request: dict[str, Any]) -> tuple[Any, Any, str
         extraction_rules.append(core.TitleSlashArtistRule("title_slash_artist"))
     resolver = core.RuleBasedTemplateContextResolver(tuple(extraction_rules))
     return normalizer, resolver, template_text, warning_acknowledged
+
+
+def _config_response(correlation_id: str, request: dict[str, Any], core: Any) -> dict[str, Any]:
+    # Non-mutating validation reuses exactly the rename config translation.
+    issues = []
+    try:
+        _translate_config(core, request)
+    except DomainRejection as exc:
+        issues = exc.issues
+    return {"protocol_version": PROTOCOL_VERSION, "correlation_id": correlation_id,
+            "operation": "validate_config", "adapter_status": "completed",
+            "valid": not issues, "issues": issues, "error": None}
 
 
 def _validate_source(request: dict[str, Any]) -> Path:
@@ -434,8 +446,12 @@ def main() -> int:
             raise AdapterFailure("manifest_unavailable", f"runtime manifest could not be read: {exc}") from exc
         manifest = _load_json_object(manifest_text, code="invalid_manifest", label="runtime manifest")
         core, identity = _load_core(manifest)
-        response = (_health_response(correlation_id, identity) if operation == "health"
-                    else _rename_response(correlation_id, request, core, safety))
+        if operation == "health":
+            response = _health_response(correlation_id, identity)
+        elif operation == "validate_config":
+            response = _config_response(correlation_id, request, core)
+        else:
+            response = _rename_response(correlation_id, request, core, safety)
     except AdapterFailure as exc:
         print(f"Music Renamer adapter: {exc.summary}", file=sys.stderr)
         print(json.dumps(_error_response(correlation_id, operation, exc.code, exc.summary), ensure_ascii=False, separators=(",", ":")))
