@@ -13,7 +13,7 @@ if ($parseErrors.Count) { throw 'Downloader parser errors' }
 # Load actual function definitions, without executing startup, GUI, or persistence.
 foreach ($name in @('New-DownloadStatistics', 'Get-DownloadItemKey', 'Test-BrowserCookieDatabaseLocked',
                     'Write-PreferredFormatSelectionLog', 'Write-DownloadProcessLine',
-                    'Write-DownloadSummary', 'Complete-DownloadSession')) {
+                    'Write-DownloadSummary', 'Get-DownloadJobProjection', 'Write-RenameSummary', 'Complete-DownloadSession')) {
     $function = $ast.Find({ param($node)
         $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
     }, $true)
@@ -88,6 +88,10 @@ if ($RunLogPath) {
         success_count=$stats.Success.Count
         failed_count=$stats.Failed.Count
         current_tracker_success=$Script:HeadlessLastResult.success
+        production_job_status=$Script:HeadlessLastResult.status
+        production_requires_attention=$Script:HeadlessLastResult.requires_attention
+        production_download_success=$Script:HeadlessLastResult.download_success
+        production_rename_results=@($stats.RenameResults.Values)
         timestamp_success=$Script:TimestampSuccess
         rename_status=$separate
         fixture_job_status=(Get-FixtureJobStatus ($ChildExitCode -ne 0) @($separate.Values))

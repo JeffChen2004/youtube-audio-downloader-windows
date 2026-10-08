@@ -5,10 +5,20 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict
 import importlib.metadata
+import importlib.util
 import json
 from pathlib import Path
 import sys
 from typing import Any
+
+_safety_spec = importlib.util.spec_from_file_location('renamer_cancellation', Path(__file__).with_name('cancellation.py'))
+_safety = importlib.util.module_from_spec(_safety_spec)
+_safety_bytecode = sys.dont_write_bytecode
+try:
+    sys.dont_write_bytecode = True
+    _safety_spec.loader.exec_module(_safety)
+finally:
+    sys.dont_write_bytecode = _safety_bytecode
 
 
 PROTOCOL_VERSION = 1
@@ -338,7 +348,8 @@ def _rejected_response(correlation_id: str, original_path: str | None,
     )
 
 
-def _rename_response(correlation_id: str, request: dict[str, Any], core: Any) -> dict[str, Any]:
+def _rename_response(correlation_id: str, request: dict[str, Any], core: Any,
+                     safety=None) -> dict[str, Any]:
     source_text = request.get("source_path")
     original_path = source_text if isinstance(source_text, str) else None
     try:
@@ -364,12 +375,26 @@ def _rename_response(correlation_id: str, request: dict[str, Any], core: Any) ->
         return _domain_response(correlation_id, classification="rejected", original_path=str(source),
                                 planning=planning, preflight_result=projected_preflight,
                                 rejection_reason="warning_not_acknowledged")
+    # Acquire BEFORE inspecting stop signals. Parent timeout acquires the same
+    # mutex before killing, eliminating a check-then-execute race. Keep ownership
+    # through final JSON flushing (main), not merely until execute returns.
+    if safety is not None:
+        safety['gate'].__enter__()
+        if _safety.requested(safety['cancel'], safety['job_cancel']):
+            response = _rejected_response(correlation_id, str(source), [_domain_issue('operation_cancelled', 'Cancelled before execution')])
+            response['classification'] = 'cancelled'
+            response['cancellation'] = {'cancel_requested': True, 'mutation_started': False}
+            return response
+        safety['mutation_started'] = True
     execution = core.RenameExecutor().execute(plan, allow_warnings=warning_acknowledged)
     projected_execution = _project_execution(execution)
-    return _domain_response(correlation_id, classification=_classification(core, execution),
+    response = _domain_response(correlation_id, classification=_classification(core, execution),
                             original_path=str(source), planning=planning,
                             preflight_result=projected_preflight,
                             execution_result=projected_execution)
+    if safety is not None:
+        response['cancellation'] = {'cancel_requested': _safety.requested(safety['cancel'], safety['job_cancel']), 'mutation_started': True}
+    return response
 
 
 def _error_response(correlation_id: str | None, operation: str | None,
@@ -386,10 +411,15 @@ def _error_response(correlation_id: str | None, operation: str | None,
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", required=True)
+    parser.add_argument('--mutation-gate', default='')
+    parser.add_argument('--cancel-file', default='')
+    parser.add_argument('--job-cancel-file', default='')
     args = parser.parse_args()
     correlation_id: str | None = None
     operation: str | None = None
     try:
+        safety = {'gate': _safety.Gate(args.mutation_gate), 'cancel': args.cancel_file,
+                  'job_cancel': args.job_cancel_file, 'mutation_started': False}
         request = _load_json_object(sys.stdin.read(), code="invalid_request", label="request")
         if isinstance(request.get("correlation_id"), str):
             correlation_id = request["correlation_id"]
@@ -405,7 +435,7 @@ def main() -> int:
         manifest = _load_json_object(manifest_text, code="invalid_manifest", label="runtime manifest")
         core, identity = _load_core(manifest)
         response = (_health_response(correlation_id, identity) if operation == "health"
-                    else _rename_response(correlation_id, request, core))
+                    else _rename_response(correlation_id, request, core, safety))
     except AdapterFailure as exc:
         print(f"Music Renamer adapter: {exc.summary}", file=sys.stderr)
         print(json.dumps(_error_response(correlation_id, operation, exc.code, exc.summary), ensure_ascii=False, separators=(",", ":")))
@@ -415,7 +445,9 @@ def main() -> int:
         print(f"Music Renamer adapter: {summary}", file=sys.stderr)
         print(json.dumps(_error_response(correlation_id, operation, "adapter_internal_error", summary), ensure_ascii=False, separators=(",", ":")))
         return 3
-    print(json.dumps(response, ensure_ascii=False, separators=(",", ":")))
+    print(json.dumps(response, ensure_ascii=False, separators=(",", ":")), flush=True)
+    # OS releases the mutation mutex at normal process exit, after stdout flush.
+    # A parent never kills between the truthful result and process exit.
     return 0
 
 

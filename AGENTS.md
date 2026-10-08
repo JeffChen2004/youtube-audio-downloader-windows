@@ -50,6 +50,9 @@
 
 - If Music Renamer Core is integrated, consume its public Core contracts rather than reimplementing metadata interpretation, template parsing, sanitization, collision analysis, identity validation, planning, or no-overwrite filesystem mutation in Downloader.
 - Keep optional integrations isolated from unrelated GUI and test dependencies. Integrating a Core library must not pull another application's GUI runtime into normal Downloader startup.
+- Music Renamer is explicit opt-in. Keep rename outcomes separate from download accounting and preserve yt-dlp archive ownership. A downstream path consumer must use the integration's verified-path validity, never assume a nonempty `filepath` remains usable after recovery failure.
+- The Music Renamer post-download bridge requires SourceMetadata finalization and final-tag admission, invokes the managed adapter, and leaves naming and mutation to Core. Handled domain outcomes must not become postprocessing infrastructure errors.
+- Do not forcibly terminate an external filesystem mutation integration inside its mutation critical section. Normal cancellation and timeouts must allow a truthful terminal/recovery result before cleanup, without starting new operations after a stop request.
 - Do not treat an integration design, adapter class, settings schema, transport protocol, or failure-statistics model as existing behavior until it has been implemented and verified in this repository.
 
 ## Runtime and sensitive data

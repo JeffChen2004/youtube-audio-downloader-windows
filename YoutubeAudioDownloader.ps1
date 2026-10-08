@@ -5,7 +5,9 @@
 
 param(
     [string]$HeadlessTrackedConfig = '',
-    [string]$HeadlessResultPath = ''
+    [string]$HeadlessResultPath = '',
+    [switch]$EnableMusicRenamer,
+    [string]$MusicRenamerConfigPath = ''
 )
 
 $Script:HeadlessMode = -not [string]::IsNullOrWhiteSpace($HeadlessTrackedConfig)
@@ -296,6 +298,9 @@ if (-not (Test-Path -LiteralPath $PlaylistTrackerScript -PathType Leaf)) { throw
 Initialize-PlaylistTrackerStorage $AppRoot
 $Script:ActiveProcess = $null
 $Script:DownloadJobHandle = [IntPtr]::Zero
+$Script:RenamerJobGate = $null
+$Script:RenamerCancelFile = $null
+$Script:RenamerStopLogged = $false
 $Script:SuspendedDownloadPids = @()
 $Script:DownloadState = 'Idle'
 $Script:DownloadCancelled = $false
@@ -1187,6 +1192,9 @@ function New-DownloadStatistics {
         AuthenticationFailureStopRequested = $false
         IsTracker = $false
         TrackerNewIds = [System.Collections.Generic.HashSet[string]]::new()
+        RenameEnabled = $false
+        RenameResults = [System.Collections.Generic.Dictionary[string,object]]::new()
+        RenameTransportFailure = $false
     }
 }
 
@@ -1248,6 +1256,30 @@ function Write-PreferredFormatSelectionLog([string]$Line, $Statistics = $null) {
 }
 
 function Write-DownloadProcessLine([string]$Line, [bool]$PreserveSource, $Statistics) {
+    if ($Line.StartsWith('__YAD_RENAME_RESULT__', [System.StringComparison]::Ordinal)) {
+        try {
+            $result = $Line.Substring('__YAD_RENAME_RESULT__'.Length) | ConvertFrom-Json
+            foreach ($field in @('schema_version','id','rename_status','verified_final_path','path_validity','recovery_status','issue_code','requires_attention')) {
+                if ($null -eq $result.PSObject.Properties[$field]) { throw 'Missing rename result field' }
+            }
+            if ($result.schema_version -ne 1 -or [string]::IsNullOrWhiteSpace($result.id) -or
+                $result.rename_status -notin @('unsupported','succeeded','unchanged','rejected','failed','requires_attention','infrastructure_failed','cancelled') -or
+                $result.path_validity -notin @('verified','unverified') -or $result.requires_attention -isnot [bool]) {
+                throw 'Invalid rename result envelope'
+            }
+            if (($result.path_validity -eq 'verified' -and [string]::IsNullOrWhiteSpace($result.verified_final_path)) -or
+                ($result.path_validity -eq 'unverified' -and $null -ne $result.verified_final_path) -or
+                ($result.rename_status -in @('requires_attention','infrastructure_failed') -and -not $result.requires_attention)) {
+                throw 'Invalid rename path/attention projection'
+            }
+            $Statistics.RenameResults["video:$($result.id)"] = $result
+            Write-Log "[Rename] item=$($result.id); status=$($result.rename_status); issue=$($result.issue_code); path=$($result.path_validity)"
+        } catch {
+            $Statistics.RenameTransportFailure = $true
+            Write-Log '[Rename] Invalid structured rename result; job cannot be reported fully successful.'
+        }
+        return
+    }
     if (Test-BrowserCookieDatabaseLocked $Line) {
         $Statistics.JobFailureCategory = 'BrowserCookieDatabaseLocked'
         $Statistics.JobFailureReason = 'Chrome Cookie database 無法存取'
@@ -1353,6 +1385,42 @@ function Write-DownloadSummary($Statistics, [bool]$Stopped, [bool]$ProcessFailed
     Write-Log '=============================='
 }
 
+function Get-DownloadJobProjection($Statistics, [bool]$Stopped, [bool]$ProcessFailed) {
+    $renameErrors = @($Statistics.RenameResults.Values | Where-Object { $_.rename_status -in @('rejected','failed','requires_attention') }).Count
+    $attention = @($Statistics.RenameResults.Values | Where-Object { $_.requires_attention }).Count -gt 0
+    $infrastructure = @($Statistics.RenameResults.Values | Where-Object { $_.rename_status -eq 'infrastructure_failed' }).Count -gt 0
+    $missing = $false
+    if ($Statistics.RenameEnabled) {
+        foreach ($key in $Statistics.Success) {
+            if (-not $Statistics.RenameResults.ContainsKey($key)) { $missing = $true }
+        }
+        if ($Stopped -or $ProcessFailed) {
+            foreach ($key in $Statistics.Items) {
+                if (-not $Statistics.Skipped.Contains($key) -and -not $Statistics.RenameResults.ContainsKey($key)) { $attention = $true }
+            }
+        }
+    }
+    $status = if ($Stopped) { 'cancelled' } elseif ($ProcessFailed -or $Statistics.Failed.Count -gt 0 -or
+        $Statistics.RenameTransportFailure -or $infrastructure -or $missing) { 'failed' } elseif ($renameErrors -gt 0) {
+        'completed_with_rename_errors'
+    } else { 'completed' }
+    return [pscustomobject]@{
+        status=$status; requires_attention=$attention; rename_errors=$renameErrors
+        missing_rename_results=$missing; download_success=(-not $Stopped -and -not $ProcessFailed -and $Statistics.Failed.Count -eq 0)
+    }
+}
+
+function Write-RenameSummary($Statistics) {
+    if (-not $Statistics.RenameEnabled -and $Statistics.RenameResults.Count -eq 0 -and -not $Statistics.RenameTransportFailure) { return }
+    foreach ($status in @('succeeded','unchanged','rejected','failed','requires_attention','unsupported','infrastructure_failed')) {
+        $count = @($Statistics.RenameResults.Values | Where-Object { $_.rename_status -eq $status }).Count
+        Write-Log "[Rename Summary] ${status}: $count"
+    }
+    if (@($Statistics.RenameResults.Values | Where-Object { $_.requires_attention }).Count) {
+        Write-Log '[Rename Summary] Requires attention: inspect the verified-path/recovery result before using affected files.'
+    }
+}
+
 function Write-TrackedPlaylistSummary($Configuration, $Statistics, [bool]$Stopped, [bool]$ProcessFailed) {
     if ($Statistics.Items.Count -eq 0 -and $ProcessFailed) {
         Write-Log '[Tracker] Check failed before playlist processing'
@@ -1384,16 +1452,44 @@ function Write-TrackedPlaylistSummary($Configuration, $Statistics, [bool]$Stoppe
     Write-Log '=============================='
 }
 
+function Request-RenamerSafeStop {
+    # Stop flag is set BEFORE attempting the gate. The bridge acquires the same
+    # gate before starting work and retains it until its terminal event is sent.
+    if (-not $Script:RenamerJobGate) { return $true }
+    [System.IO.File]::WriteAllText($Script:RenamerCancelFile, 'stop')
+    $owned = $false
+    try { $owned = $Script:RenamerJobGate.WaitOne(0) }
+    catch [System.Threading.AbandonedMutexException] { $owned = $true }
+    if ($owned) { return $true } # caller releases after termination/close
+    if (-not $Script:RenamerStopLogged) { Write-Log '[Rename] Stop deferred until terminal Core result is projected.'; $Script:RenamerStopLogged=$true }
+    return $false
+}
+
+function Release-RenamerStopGate {
+    if ($Script:RenamerJobGate) { $Script:RenamerJobGate.ReleaseMutex() }
+}
+
 function Close-DownloadJob {
-    if ($Script:DownloadJobHandle -ne [IntPtr]::Zero) {
-        [YtAudioDownloader.DownloadProcessController]::CloseJob($Script:DownloadJobHandle)
-        $Script:DownloadJobHandle = [IntPtr]::Zero
-    }
+    if (-not (Request-RenamerSafeStop)) { return }
+    try {
+        if ($Script:DownloadJobHandle -ne [IntPtr]::Zero) {
+            [YtAudioDownloader.DownloadProcessController]::CloseJob($Script:DownloadJobHandle)
+            $Script:DownloadJobHandle = [IntPtr]::Zero
+        }
+    } finally { Release-RenamerStopGate }
+    if ($Script:RenamerJobGate) { $Script:RenamerJobGate.Dispose(); $Script:RenamerJobGate=$null }
+    if ($Script:RenamerCancelFile -and (Test-Path -LiteralPath $Script:RenamerCancelFile)) { Remove-Item -LiteralPath $Script:RenamerCancelFile -Force }
+    $Script:RenamerCancelFile=$null
 }
 
 function Suspend-DownloadProcess {
     if ($Script:DownloadState -ne 'Running') { return $false }
     if (-not $Script:ActiveProcess -or $Script:ActiveProcess.HasExited) { return $false }
+    $gateOwned = $false
+    if ($Script:RenamerJobGate) {
+        try { $gateOwned = $Script:RenamerJobGate.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $gateOwned = $true }
+        if (-not $gateOwned) { Write-Log '[Rename] Cannot pause an active external transaction.'; return $false }
+    }
     try {
         $Script:SuspendedDownloadPids = @(
             [YtAudioDownloader.DownloadProcessController]::SuspendTree($Script:ActiveProcess.Id)
@@ -1408,7 +1504,7 @@ function Suspend-DownloadProcess {
         $cancelButton.Text = '停止'
         Write-Log "[Download] Failed to pause process: $($_.Exception.Message)"
         return $false
-    }
+    } finally { if ($gateOwned) { $Script:RenamerJobGate.ReleaseMutex() } }
 }
 
 function Resume-DownloadProcess {
@@ -1440,6 +1536,12 @@ function Stop-DownloadProcessTree {
     $cancelButton.Text = '結束中…'
     $cancelButton.Enabled = $false
     Write-Log '[Download] User requested termination'
+    $safeToStop = Request-RenamerSafeStop
+    if ($previousState -eq 'Paused') {
+        [YtAudioDownloader.DownloadProcessController]::ResumeProcesses([int[]]$Script:SuspendedDownloadPids)
+        $Script:SuspendedDownloadPids=@()
+    }
+    if (-not $safeToStop) { return }
     Write-Log '[Download] Terminating current download process...'
     $terminated = $false
     try {
@@ -1463,6 +1565,7 @@ function Stop-DownloadProcessTree {
             catch { Write-Log "[Download] Failed to terminate fallback process tree: $($_.Exception.Message)" }
         }
     }
+    finally { Release-RenamerStopGate }
     if (-not $terminated -and $Script:ActiveProcess -and -not $Script:ActiveProcess.HasExited) {
         $Script:DownloadCancelled = $false
         $Script:DownloadState = $previousState
@@ -1525,6 +1628,7 @@ function Stop-DownloadForProviderFailure($Context, [string]$Message) {
     $Script:DownloadState = 'Stopping'
     $cancelButton.Text = '結束中…'
     $cancelButton.Enabled = $false
+    if (-not (Request-RenamerSafeStop)) { return }
     try {
         if ($Script:DownloadJobHandle -ne [IntPtr]::Zero) {
             [YtAudioDownloader.DownloadProcessController]::TerminateJobAndTree(
@@ -1536,7 +1640,7 @@ function Stop-DownloadForProviderFailure($Context, [string]$Message) {
         }
     } catch {
         Write-Log "[Download] Failed to terminate process tree: $($_.Exception.Message)"
-    }
+    } finally { Release-RenamerStopGate }
 }
 
 function Stop-DownloadForAuthenticationFailure($Context) {
@@ -1545,6 +1649,7 @@ function Stop-DownloadForAuthenticationFailure($Context) {
     $Script:DownloadState = 'Stopping'
     $cancelButton.Text = '結束中…'
     $cancelButton.Enabled = $false
+    if (-not (Request-RenamerSafeStop)) { return }
     try {
         if ($Script:DownloadJobHandle -ne [IntPtr]::Zero) {
             [YtAudioDownloader.DownloadProcessController]::TerminateJobAndTree(
@@ -1556,7 +1661,7 @@ function Stop-DownloadForAuthenticationFailure($Context) {
         }
     } catch {
         Write-Log "[Auth Error] 無法終止失敗的 yt-dlp process：$($_.Exception.Message)"
-    }
+    } finally { Release-RenamerStopGate }
 }
 
 function Complete-ProviderHealthPing($Context, [bool]$Succeeded) {
@@ -1644,14 +1749,24 @@ function Complete-DownloadSession($Context) {
         Close-DownloadJob
         if ($Context.ProviderSession) { Stop-PoTokenProvider }
         Write-DownloadSummary $Context.Statistics $Script:DownloadCancelled $processFailed $Context.PlaylistRequested
+        Write-RenameSummary $Context.Statistics
+        $jobProjection = Get-DownloadJobProjection $Context.Statistics $Script:DownloadCancelled $processFailed
+        if ($Context.Statistics.RenameEnabled -or $Context.Statistics.RenameResults.Count -gt 0 -or $Context.Statistics.RenameTransportFailure) {
+            Write-Log "[Job] status=$($jobProjection.status); requires_attention=$($jobProjection.requires_attention)"
+        }
         if ($Context.TrackerConfiguration) {
-            $trackerSuccessful = (-not $processFailed -and -not $Script:DownloadCancelled -and $Context.Statistics.Failed.Count -eq 0)
+            $trackerSuccessful = $jobProjection.status -eq 'completed'
             Write-TrackedPlaylistSummary $Context.TrackerConfiguration $Context.Statistics $Script:DownloadCancelled $processFailed
             try { Update-TrackedPlaylistTimestamps $Context.TrackerConfigPath $trackerSuccessful }
             catch { Write-Log "[Tracker] 無法更新檢查時間：$($_.Exception.Message)" }
             if ($Script:HeadlessMode) {
                 $Script:HeadlessLastResult = [pscustomobject]@{
                     success = $trackerSuccessful
+                    status = $jobProjection.status
+                    download_success = $jobProjection.download_success
+                    requires_attention = $jobProjection.requires_attention
+                    rename_results = @($Context.Statistics.RenameResults.Values)
+                    rename_requested = $Context.Statistics.RenameEnabled
                     new_videos_downloaded = $Context.Statistics.Success.Count
                     no_change = ($trackerSuccessful -and $Context.Statistics.Success.Count -eq 0)
                     failed_items = $Context.Statistics.Failed.Count
@@ -1683,6 +1798,13 @@ function Update-DownloadSession {
     if (-not $context) { return }
     try {
         Drain-DownloadProcessOutput $context
+        if ($Script:DownloadState -eq 'Stopping' -and -not $Script:ActiveProcess.HasExited -and $Script:RenamerJobGate) {
+            if (Request-RenamerSafeStop) {
+                try { [YtAudioDownloader.DownloadProcessController]::TerminateJobAndTree($Script:DownloadJobHandle, $Script:ActiveProcess.Id) }
+                finally { Release-RenamerStopGate }
+            }
+            return
+        }
         if ($context.Statistics.JobFailureCategory -eq 'BrowserCookieDatabaseLocked' -and
             -not $Script:ActiveProcess.HasExited) {
             Stop-DownloadForAuthenticationFailure $context
@@ -1731,6 +1853,12 @@ function Start-Download {
         $startButton.Enabled = $false
         $cancelButton.Enabled = $true
         Ensure-Tools
+        $renameSnapshot = $null
+        if ($EnableMusicRenamer) {
+            Import-Module (Join-Path $AppRoot 'integrations\music-renamer\MusicRenamerIntegration.psm1') -Force
+            $renameSnapshot = New-MusicRenamerDownloadSnapshot -Enabled -ConfigPath $MusicRenamerConfigPath
+            $downloadStatistics.RenameEnabled = $true
+        }
 
         $format = if ($TrackerConfiguration -and $TrackerConfiguration.audio_format) { [string]$TrackerConfiguration.audio_format } else { $formatBox.SelectedItem.ToString().ToLowerInvariant() }
         $qualityMode = if ($TrackerConfiguration -and $TrackerConfiguration.quality_mode) { [string]$TrackerConfiguration.quality_mode } else { $qualityModeBox.SelectedItem.ToString() }
@@ -1805,8 +1933,11 @@ function Start-Download {
         $preserveMetadataValue = if ($preserveSource) { 'true' } else { 'false' }
         $args.Add('--use-postprocessor'); $args.Add("SourceMetadataPrepare:when=video;client=$downloadClient;preserve=$preserveMetadataValue")
         $args.Add('--use-postprocessor'); $args.Add("SourceMetadata:when=after_move;client=$downloadClient;preserve=$preserveMetadataValue")
-        # Count an item as successful only after metadata and cover processing
-        # have completed. This remains a per-video event for playlists.
+        if ($renameSnapshot) {
+            foreach ($argument in (Get-MusicRenamerPostprocessorArguments $renameSnapshot)) { $args.Add($argument) }
+        }
+        # Preserve existing per-video after_video accounting. Under ignore-errors
+        # this is not proof all PPs succeeded; rename results remain separate.
         $args.Add('--print'); $args.Add('after_video:__YAD_ITEM_SUCCESS__%(.{id,playlist_index,playlist_count,n_entries,format_id})j')
         $args.Add('--progress')
         $args.Add('-o'); $args.Add((Join-Path $destination '%(playlist_index&{} - |)s%(title)s [%(id)s].%(ext)s'))
@@ -1846,23 +1977,43 @@ function Start-Download {
         $psi.RedirectStandardError = $true
         $psi.CreateNoWindow = $true
         $psi.Arguments = (($args | ForEach-Object { ConvertTo-ProcessArgument $_ }) -join ' ')
+        # Always remove ambient opt-in configuration from this child first.
+        $psi.EnvironmentVariables.Remove('YAD_MUSIC_RENAMER_CONFIG')
+        $psi.EnvironmentVariables.Remove('YAD_RENAMER_GATE')
+        $psi.EnvironmentVariables.Remove('YAD_RENAMER_CANCEL')
+        if ($renameSnapshot) { $psi.EnvironmentVariables['YAD_MUSIC_RENAMER_CONFIG'] = $renameSnapshot }
+        if ($renameSnapshot) {
+            $controlId=[guid]::NewGuid().ToString('N')
+            $gateName='Local\YAD.Renamer.Job.' + $controlId
+            $Script:RenamerJobGate=[System.Threading.Mutex]::new($false, $gateName)
+            $Script:RenamerStopLogged=$false
+            $Script:RenamerCancelFile=Join-Path $AppRoot ('logs\rename-job-' + $controlId + '.tmp')
+            $psi.EnvironmentVariables['YAD_RENAMER_GATE']=$gateName
+            $psi.EnvironmentVariables['YAD_RENAMER_CANCEL']=$Script:RenamerCancelFile
+        }
         # The CLR helper owns the async stream callbacks.  PowerShell itself
         # only reads the queue on the UI thread, avoiding deadlocks and event
         # callback failures in Windows PowerShell 5.1.
         $loggedProcess = [YtAudioDownloader.LoggedProcess]::new()
-        $loggedProcess.Start($psi)
-        $Script:ActiveProcess = $loggedProcess.Process
+        $startupGate=$Script:RenamerJobGate
+        if ($startupGate) { [void]$startupGate.WaitOne() }
         try {
+            $loggedProcess.Start($psi)
+            $Script:ActiveProcess = $loggedProcess.Process
             $Script:DownloadJobHandle = [YtAudioDownloader.DownloadProcessController]::CreateKillOnCloseJob()
             [YtAudioDownloader.DownloadProcessController]::AssignToJob(
                 $Script:DownloadJobHandle,
                 $Script:ActiveProcess.Handle
             )
         } catch {
-            if ($Script:DownloadJobHandle -ne [IntPtr]::Zero) { Close-DownloadJob }
-            [YtAudioDownloader.DownloadProcessController]::TerminateTree($Script:ActiveProcess.Id)
+            # Startup gate is still owned: no protected bridge can enter.
+            if ($Script:ActiveProcess) { [YtAudioDownloader.DownloadProcessController]::TerminateTree($Script:ActiveProcess.Id) }
+            if ($Script:DownloadJobHandle -ne [IntPtr]::Zero) {
+                [YtAudioDownloader.DownloadProcessController]::CloseJob($Script:DownloadJobHandle)
+                $Script:DownloadJobHandle=[IntPtr]::Zero
+            }
             throw "無法建立下載 process Job Object：$($_.Exception.Message)"
-        }
+        } finally { if ($startupGate) { $startupGate.ReleaseMutex() } }
         $Script:DownloadState = 'Running'
         $Script:DownloadContext = [pscustomobject]@{
             LoggedProcess = $loggedProcess
@@ -1969,6 +2120,11 @@ if ($Script:HeadlessMode) {
     $loadedAssemblyNames = @([AppDomain]::CurrentDomain.GetAssemblies() | ForEach-Object { $_.GetName().Name })
     $resultEnvelope = [ordered]@{
         success = [bool]$Script:HeadlessLastResult.success
+        status = if ($Script:HeadlessLastResult.status) { $Script:HeadlessLastResult.status } elseif ($Script:HeadlessLastResult.success) { 'completed' } else { 'failed' }
+        download_success = if ($null -ne $Script:HeadlessLastResult.PSObject.Properties['download_success']) { [bool]$Script:HeadlessLastResult.download_success } else { [bool]$Script:HeadlessLastResult.success }
+        requires_attention = [bool]$Script:HeadlessLastResult.requires_attention
+        rename_requested = [bool]$EnableMusicRenamer
+        rename_results = @($Script:HeadlessLastResult.rename_results | Where-Object { $null -ne $_ })
         new_videos_downloaded = [int]$Script:HeadlessLastResult.new_videos_downloaded
         no_change = [bool]$Script:HeadlessLastResult.no_change
         failed_items = [int]$Script:HeadlessLastResult.failed_items
@@ -1998,6 +2154,15 @@ $panel = [System.Windows.Forms.TableLayoutPanel]@{ Dock = 'Fill'; Padding = [Sys
 [void]$panel.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Percent, 100))
 [void]$panel.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::AutoSize))
 $downloadTab.Controls.Add($panel)
+$form.Add_FormClosing({
+    param($sender, $eventArgs)
+    if ($Script:RenamerJobGate -and $Script:DownloadState -in @('Running','Paused','Stopping')) {
+        if ($Script:DownloadState -ne 'Stopping') { Stop-DownloadProcessTree }
+        # Keep the owner/timer alive to drain recovery truth and close the Job
+        # Object only after the protected operation is terminal.
+        $eventArgs.Cancel=$true
+    }
+})
 $form.Add_FormClosed({
     if ($downloadTimer) { $downloadTimer.Stop() }
     if ($Script:DownloadState -in @('Running', 'Paused')) {

@@ -39,7 +39,9 @@ function Invoke-MusicRenamerRawProcess {
         [Parameter(Mandatory=$true)][string[]]$Arguments,
         [string]$StandardInput = '',
         [ValidateRange(1, 3600)][int]$TimeoutSeconds = 30,
-        [string]$WorkingDirectory = $script:AppRoot
+        [string]$WorkingDirectory = $script:AppRoot,
+        [string]$MutationGate = '',
+        [string]$CancelFile = ''
     )
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
     $psi.FileName = $FileName
@@ -51,6 +53,7 @@ function Invoke-MusicRenamerRawProcess {
     $psi.CreateNoWindow = $true
     $psi.Arguments = (($Arguments | ForEach-Object { ConvertTo-MusicRenamerProcessArgument $_ }) -join ' ')
     $process = [System.Diagnostics.Process]::new()
+    $gate = $null
     $process.StartInfo = $psi
     if (-not $process.Start()) { throw "Process could not be started: $FileName" }
     try {
@@ -58,18 +61,43 @@ function Invoke-MusicRenamerRawProcess {
         $stderrTask = $process.StandardError.ReadToEndAsync()
         if ($StandardInput.Length -gt 0) { $process.StandardInput.Write($StandardInput) }
         $process.StandardInput.Close()
-        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
-            try { $process.Kill() } catch { }
-            $process.WaitForExit()
-            return [pscustomobject]@{ TimedOut=$true; ExitCode=$null; Stdout=$stdoutTask.Result; Stderr=($stderrTask.Result + 'process timed out and was terminated') }
+        $gate = if ($MutationGate) { [System.Threading.Mutex]::new($false, $MutationGate) } else { $null }
+        $deadline = [datetime]::UtcNow.AddSeconds($TimeoutSeconds)
+        $escalated = $false
+        while (-not $process.WaitForExit(100)) {
+            if ([datetime]::UtcNow -lt $deadline) { continue }
+            if ($CancelFile) { [System.IO.File]::WriteAllText($CancelFile, 'timeout') }
+            $owned = $false
+            try {
+                if ($gate) {
+                    try { $owned = $gate.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $owned = $true }
+                } else { $owned = $true }
+                if ($owned) {
+                    if ($process.HasExited) { break }
+                    $process.Kill()
+                    $process.WaitForExit()
+                    return [pscustomobject]@{ TimedOut=$true; ExitCode=$null; Stdout=$stdoutTask.Result; Stderr=($stderrTask.Result + 'pre-mutation process timed out and was terminated') }
+                }
+                if (-not $escalated) {
+                    [Console]::Error.WriteLine('[MusicRenamer] timeout deferred: waiting for terminal Core result')
+                    $escalated = $true
+                }
+            } finally { if ($gate -and $owned) { $gate.ReleaseMutex() } }
         }
         return [pscustomobject]@{
             TimedOut = $false
+            TimeoutDeferred = $escalated
             ExitCode = $process.ExitCode
             Stdout = $stdoutTask.Result
             Stderr = $stderrTask.Result
         }
-    } finally { $process.Dispose() }
+    } finally {
+        # An unexpected transport/stop-file error must not orphan an executing
+        # adapter and release the enclosing job protection while it still runs.
+        if (-not $process.HasExited) { $process.WaitForExit() }
+        if ($gate) { $gate.Dispose() }
+        $process.Dispose()
+    }
 }
 
 function Get-MusicRenamerManagedPythonPath([string]$RuntimeRoot = $script:DefaultRuntimeRoot) {
@@ -298,7 +326,10 @@ function Invoke-MusicRenamerAdapterRename {
         [string]$RuntimeRoot = $script:DefaultRuntimeRoot,
         [string]$AdapterPath = $script:DefaultAdapterPath,
         [string]$ManifestPath = (Join-Path $RuntimeRoot 'integration-manifest.json'),
-        [ValidateRange(1, 300)][int]$TimeoutSeconds = 30
+        [ValidateRange(1, 300)][int]$TimeoutSeconds = 30,
+        [string]$MutationGate = ('Local\YAD.Rename.' + [guid]::NewGuid().ToString('N')),
+        [string]$CancelFile = '',
+        [string]$JobCancelFile = ''
     )
     try { $resolved = Resolve-MusicRenamerManagedPython $RuntimeRoot }
     catch { return New-MusicRenamerFailure $CorrelationId 'runtime_unavailable' $_.Exception.Message }
@@ -322,10 +353,13 @@ function Invoke-MusicRenamerAdapterRename {
         }
     }
     try {
-        $raw = Invoke-MusicRenamerRawProcess -FileName $resolved.Executable -Arguments @($AdapterPath, '--manifest', $ManifestPath) -StandardInput ($request | ConvertTo-Json -Depth 10 -Compress) -TimeoutSeconds $TimeoutSeconds
+        if (-not $CancelFile) { $CancelFile = Join-Path ([System.IO.Path]::GetTempPath()) ('yad-rename-' + [guid]::NewGuid().ToString('N') + '.tmp') }
+        $adapterArguments=@($AdapterPath, '--manifest', $ManifestPath, '--mutation-gate', $MutationGate, '--cancel-file', $CancelFile)
+        if ($JobCancelFile) { $adapterArguments += @('--job-cancel-file', $JobCancelFile) }
+        $raw = Invoke-MusicRenamerRawProcess -FileName $resolved.Executable -Arguments $adapterArguments -StandardInput ($request | ConvertTo-Json -Depth 10 -Compress) -TimeoutSeconds $TimeoutSeconds -MutationGate $MutationGate -CancelFile $CancelFile
     } catch {
         return New-MusicRenamerFailure $CorrelationId 'adapter_start_failed' $_.Exception.Message
-    }
+    } finally { if ($CancelFile -and (Test-Path -LiteralPath $CancelFile)) { Remove-Item -LiteralPath $CancelFile -Force } }
     if ($raw.TimedOut) {
         return New-MusicRenamerFailure $CorrelationId 'adapter_timeout' 'Adapter timed out and was terminated.' $raw.Stderr
     }
@@ -352,7 +386,7 @@ function Invoke-MusicRenamerAdapterRename {
     if ($response.operation -ne 'rename' -or $response.adapter_status -ne 'completed') {
         return New-MusicRenamerFailure $CorrelationId 'invalid_response' 'Adapter did not return a completed rename domain response.' $raw.Stderr
     }
-    if ($response.classification -notin @('renamed', 'unchanged', 'rejected', 'failed', 'requires_attention')) {
+    if ($response.classification -notin @('renamed', 'unchanged', 'rejected', 'failed', 'requires_attention', 'cancelled')) {
         return New-MusicRenamerFailure $CorrelationId 'invalid_response' 'Adapter returned an unknown rename classification.' $raw.Stderr
     }
     if ($null -ne $response.error) {
@@ -377,8 +411,12 @@ function Invoke-MusicRenamerAdapterRename {
     if ($response.path.final_location -in @('missing', 'unknown') -and $response.classification -ne 'requires_attention') {
         return New-MusicRenamerFailure $CorrelationId 'invalid_response' 'Unknown or missing final location must require attention.' $raw.Stderr
     }
-    if ($response.classification -ne 'rejected' -and $null -eq $response.execution) {
+    if ($response.classification -notin @('rejected','cancelled') -and $null -eq $response.execution) {
         return New-MusicRenamerFailure $CorrelationId 'invalid_response' 'Non-rejected rename result must include a Core execution projection.' $raw.Stderr
+    }
+    if ($response.classification -eq 'cancelled' -and ($null -ne $response.execution -or
+        $null -eq $response.PSObject.Properties['cancellation'] -or $response.cancellation.mutation_started -ne $false)) {
+        return New-MusicRenamerFailure $CorrelationId 'invalid_response' 'Cancellation cannot conceal filesystem mutation.' $raw.Stderr
     }
     if ($null -ne $response.execution) {
         foreach ($name in @('transaction_id', 'plan_id', 'outcome', 'preflight_issues', 'operations')) {
@@ -408,6 +446,44 @@ function Invoke-MusicRenamerAdapterRename {
     return $response
 }
 
+function ConvertTo-MusicRenamerConfigSnapshot($Config) {
+    # Validate only snapshot shape; Core/adapter owns all naming semantics.
+    $required = @('template','warning_acknowledged','artist_aliases','title_cleanup_rules','extraction')
+    if ($null -eq $Config -or @(Compare-Object ($required | Sort-Object) (@($Config.PSObject.Properties.Name) | Sort-Object)).Count) {
+        throw 'Music Renamer config must contain exactly the documented snapshot fields.'
+    }
+    if ($Config.template -isnot [string] -or [string]::IsNullOrWhiteSpace($Config.template) -or
+        $Config.warning_acknowledged -isnot [bool] -or $Config.artist_aliases -isnot [array] -or
+        $Config.title_cleanup_rules -isnot [array]) { throw 'Invalid Music Renamer config snapshot types.' }
+    if ($null -eq $Config.extraction -or
+        @(Compare-Object @('artist_quoted_title','title_slash_artist') (@($Config.extraction.PSObject.Properties.Name) | Sort-Object)).Count -or
+        $Config.extraction.artist_quoted_title -isnot [bool] -or $Config.extraction.title_slash_artist -isnot [bool]) {
+        throw 'Invalid Music Renamer extraction snapshot.'
+    }
+    return $Config | ConvertTo-Json -Depth 20 -Compress
+}
+
+function New-MusicRenamerDownloadSnapshot {
+    param([switch]$Enabled, [string]$ConfigPath = '')
+    if (-not $Enabled) { return $null }
+    if ($ConfigPath) {
+        $config = [System.IO.File]::ReadAllText([System.IO.Path]::GetFullPath($ConfigPath)) | ConvertFrom-Json
+    } else {
+        $config = [pscustomobject]@{
+            template='{artist} - {title} [{youtube_id}]'; warning_acknowledged=$false
+            artist_aliases=@(); title_cleanup_rules=@()
+            extraction=[pscustomobject]@{ artist_quoted_title=$false; title_slash_artist=$false }
+        }
+    }
+    return ConvertTo-MusicRenamerConfigSnapshot $config
+}
+
+function Get-MusicRenamerPostprocessorArguments([string]$Snapshot) {
+    if (-not [string]::IsNullOrWhiteSpace($Snapshot)) {
+        return @('--use-postprocessor', 'MusicRenamer:when=after_move')
+    }
+}
+
 Export-ModuleMember -Function @(
     'Get-MusicRenamerManagedPythonPath',
     'Resolve-MusicRenamerManagedPython',
@@ -416,5 +492,8 @@ Export-ModuleMember -Function @(
     'Write-MusicRenamerRuntimeManifest',
     'Install-MusicRenamerManagedRuntime',
     'Invoke-MusicRenamerAdapterHealth',
-    'Invoke-MusicRenamerAdapterRename'
+    'Invoke-MusicRenamerAdapterRename',
+    'ConvertTo-MusicRenamerConfigSnapshot',
+    'New-MusicRenamerDownloadSnapshot',
+    'Get-MusicRenamerPostprocessorArguments'
 )
